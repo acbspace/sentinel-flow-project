@@ -21,9 +21,8 @@ SentinelFlow turns a stream of telemetry into handled incidents, end to end:
 
 It is built as eight Go microservices plus a React dashboard, and is portfolio
 quality throughout: everything compiles, nothing is stubbed, no error is
-swallowed, and every design decision is recorded in an ADR. The full roadmap
-(Milestones 1–5) is implemented; what is deliberately *out of scope* is
-[named, not implied](#whats-deliberately-not-here).
+swallowed, and every design decision is recorded in an ADR. What is deliberately
+*out of scope* is [named, not implied](#whats-deliberately-not-here).
 
 ## Repository Structure
 
@@ -41,15 +40,15 @@ swallowed, and every design decision is recorded in an ADR. The full roadmap
 ├── internal
 │   ├── event               # the versioned telemetry contract
 │   ├── ingest  · engine    # HTTP handler; consume + persist loop
-│   ├── incident · correlate # incident domain; windowed evaluator      (m2)
-│   ├── oncall   · alerting  # escalation policy; alert workflow         (m3)
-│   ├── runbook  · remediate # runbook catalog; gated remediation flow   (m4)
+│   ├── incident · correlate # incident domain; windowed evaluator
+│   ├── oncall   · alerting  # escalation policy; alert workflow
+│   ├── runbook  · remediate # runbook catalog; gated remediation flow
 │   ├── incidentapi         # read / lifecycle / approval HTTP handler
 │   ├── kafkax  · store     # franz-go client; pgx pool + queries
 │   ├── obs · httpx · config # telemetry; server plumbing; env parsing
 │   └── demo · migrate      # traffic simulator; migration runner
-├── web                     # React + TypeScript dashboard               (m5)
-├── deploy/k8s              # Kubernetes manifests: workloads, probes, HPAs (m5)
+├── web                     # React + TypeScript dashboard
+├── deploy/k8s              # Kubernetes manifests: workloads, probes, HPAs
 ├── build                   # Dockerfiles, nginx config, OTel Collector config
 ├── migrations              # embedded SQL
 ├── test/integration        # end-to-end tests (build tag: integration)
@@ -69,54 +68,20 @@ swallowed, and every design decision is recorded in an ADR. The full roadmap
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    subgraph demo["Demo producers"]
-        OS["order-service<br/>POST /demo/orders"]
-        PS["payment-service<br/>POST /demo/payments"]
-    end
+```
+INGEST
+  demo services ──▶ ingestion-api ──▶ Kafka ──▶ incident-engine ──▶ PostgreSQL
+                    validate,          durable   consume, persist,   events +
+                    publish (202)      log       correlate (ticker)  incidents
 
-    subgraph pipeline["Ingestion + correlation"]
-        API["ingestion-api<br/>POST /v1/events<br/><i>validate + publish</i>"]
-        K[("Kafka<br/>telemetry.events.v1<br/>3 partitions")]
-        ENG["incident-engine<br/><i>consume + persist</i><br/><i>+ correlate (ticker)</i>"]
-    end
+REACT   incident-engine opens an incident; two Temporal workers act on it
+  alerting     ──▶ page on-call, escalate through the policy, audit  ──▶ notifications
+  remediation  ──▶ run the runbook, stop at an approval gate         ──▶ actions
 
-    DB[("PostgreSQL<br/>telemetry_events · incidents<br/>notifications · remediation_actions")]
-    RAPI["incidents-api<br/>GET /v1/incidents<br/>GET /v1/events<br/><i>read + lifecycle + approve</i>"]
-    ALERT["alerting<br/><i>Temporal worker</i><br/><i>+ starter poller</i>"]
-    REM["remediation<br/><i>runbook worker</i><br/><i>+ approval gates</i>"]
-    T[("Temporal<br/>escalation + runbook<br/>workflows")]
-    USER([on-call / dashboard])
-
-    OS -->|"HTTP + traceparent"| PS
-    OS -->|"telemetry event"| API
-    PS -->|"telemetry event"| API
-    API -->|"key: tenant:service"| K
-    K -->|"manual offset commits"| ENG
-    ENG -->|"INSERT event ON CONFLICT<br/>(event_id) DO NOTHING"| DB
-    ENG -->|"window query →<br/>UPSERT active incident"| DB
-    DB -->|"open incidents"| ALERT
-    ALERT -->|"one workflow<br/>per incident"| T
-    T -->|"page · wait · escalate"| ALERT
-    ALERT -->|"notifications"| DB
-    DB -->|"open incidents"| REM
-    REM -->|"one runbook run<br/>per incident"| T
-    T -->|"step · gate · halt"| REM
-    REM -->|"action audit trail"| DB
-    DB -->|"incidents · events · timeline · actions"| RAPI
-    RAPI -->|"list · get · ack · resolve"| USER
-    RAPI -.->|"ack/resolve · approve/reject signals"| T
-    USER -.->|"approve / reject a step"| RAPI
-
-    style API fill:#2563eb,stroke:#1e40af,color:#fff
-    style ENG fill:#2563eb,stroke:#1e40af,color:#fff
-    style RAPI fill:#2563eb,stroke:#1e40af,color:#fff
-    style ALERT fill:#2563eb,stroke:#1e40af,color:#fff
-    style REM fill:#2563eb,stroke:#1e40af,color:#fff
-    style K fill:#7c3aed,stroke:#5b21b6,color:#fff
-    style T fill:#7c3aed,stroke:#5b21b6,color:#fff
-    style DB fill:#059669,stroke:#047857,color:#fff
+SERVE
+  incidents-api ──▶ dashboard + on-call
+                    list · acknowledge / resolve · approve / reject a step
+                    (each action also signals the alerting / remediation workflow)
 ```
 
 Four ideas carry the design. Each is explained in depth in
@@ -142,19 +107,14 @@ Four ideas carry the design. Each is explained in depth in
 The incident lifecycle is one-directional — an incident is acknowledged, then
 resolved, but never reopened:
 
-```mermaid
-stateDiagram-v2
-    [*] --> open: rule fires
-    open --> acknowledged: operator acknowledges
-    open --> resolved: resolve / auto-resolve
-    acknowledged --> resolved: resolve / auto-resolve
-    resolved --> [*]
-    note right of open
-      repeat detections group into
-      the active incident — one per
-      fingerprint (rule:tenant:service)
-    end note
 ```
+open ──(acknowledge)──▶ acknowledged ──(resolve)──▶ resolved
+  └──────────────(resolve / auto-resolve)────────────┘
+```
+
+Repeat detections group into the active incident (one per fingerprint), so a
+spike is one incident with a rising count rather than a flood; a recurrence after
+resolution opens a fresh one.
 
 ## Benchmarks
 
@@ -345,21 +305,6 @@ close it already in place:
 - **Single-node Kafka (RF=1)**, no retention policy, JSON on the wire.
 - **No frontend tests**, and no multi-region deployment — the latter is
   [analysis](docs/architecture.md), not a demo that would imply more than it does.
-
-## Roadmap
-
-All five milestones are implemented.
-
-| Milestone | Status | Summary |
-|---|---|---|
-| 1 — Ingestion | ✅ | Lossless telemetry ingestion over a replayable Kafka log |
-| 2 — Correlation | ✅ | Windowed detection → deduplicated incidents with a lifecycle |
-| 3 — Alerting | ✅ | Temporal escalation, on-call rotations, auditable page timeline |
-| 4 — Remediation | ✅ | Runbook engine with per-step approval gates and a full audit trail |
-| 5 — Interface & platform | ✅ | React dashboard, OpenTelemetry Collector, Kubernetes manifests |
-
-**Next (hardening):** dead-letter topic; auth on the ingestion API; retention /
-partitioning; a schema registry with a binary format; `golangci-lint` in CI.
 
 ## License
 
