@@ -1,0 +1,92 @@
+# PostgreSQL as a single-replica StatefulSet.
+#
+# A StatefulSet, not a Deployment, because the pod needs stable identity and a
+# volume that survives rescheduling. One replica because this manifest set exists
+# to mirror the Compose topology honestly -- a real deployment hands PostgreSQL to
+# an operator (CloudNativePG) or a managed service rather than running it here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: sentinelflow
+spec:
+  # Headless: clients resolve the pod directly, and there is nothing to load
+  # balance across with a single primary.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: sentinelflow
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: sentinelflow
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: {name: sentinelflow-secrets, key: POSTGRES_USER}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: sentinelflow-secrets, key: POSTGRES_PASSWORD}
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef: {name: sentinelflow-secrets, key: POSTGRES_DB}
+            # Deterministic collation, so index behaviour matches everywhere.
+            - name: POSTGRES_INITDB_ARGS
+              value: "--encoding=UTF8 --locale=C"
+            # The default data directory is the volume mount point itself, which
+            # initdb refuses to use when it contains lost+found.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -q -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -q -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

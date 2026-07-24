@@ -1,0 +1,25 @@
+{
+  "runbooks": [
+    {
+      "id": "error-rate-response",
+      "name": "Elevated error rate response",
+      "match": {"rule_id": "error_rate"},
+      "approval_timeout": "10m",
+      "steps": [
+        {
+          "name": "capture diagnostics",
+          "kind": "noop",
+          "mode": "auto",
+          "params": {"collect": "recent-errors,latency-percentiles"}
+        },
+        {
+          "name": "restart unhealthy instances",
+          "kind": "webhook",
+          "mode": "approval",
+          "target": "http://localhost:9000/remediation/restart",
+          "params": {"strategy": "rolling", "max_unavailable": "1"}
+        }
+      ]
+    }
+  ]
+}

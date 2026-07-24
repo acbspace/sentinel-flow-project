@@ -1,0 +1,33 @@
+# The dashboard image: build the bundle with Node, serve it with nginx.
+#
+# The build context is the repository root (so this file can see web/), which is
+# why every COPY below is prefixed with web/.
+
+# ---- build stage -------------------------------------------------------------
+FROM node:24-alpine AS build
+
+WORKDIR /src
+
+# Dependencies change far less often than source; resolve them in their own layer.
+# npm ci (not install) so the build uses exactly the committed lockfile.
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-fund --no-audit
+
+COPY web/ ./
+
+# Runs tsc --noEmit before vite build, so a type error fails the image build
+# rather than shipping.
+RUN npm run build
+
+# ---- runtime stage -----------------------------------------------------------
+# The unprivileged nginx image runs as a non-root user on port 8080, matching the
+# posture of every Go service in this stack.
+FROM nginxinc/nginx-unprivileged:1.27-alpine AS runtime
+
+COPY build/nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /src/dist /usr/share/nginx/html
+
+EXPOSE 8080
+
+LABEL org.opencontainers.image.title="sentinelflow-dashboard" \
+      org.opencontainers.image.source="https://github.com/acbspace/sentinel-flow-project"

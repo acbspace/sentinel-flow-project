@@ -1,0 +1,86 @@
+# The read and lifecycle API. Read-mostly and stateless, so it scales freely on
+# request load; it is also what the dashboard talks to.
+apiVersion: v1
+kind: Service
+metadata:
+  name: incidents-api
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/name: incidents-api
+    app.kubernetes.io/part-of: sentinelflow
+spec:
+  selector:
+    app.kubernetes.io/name: incidents-api
+  ports:
+    - name: http
+      port: 8084
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: incidents-api
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/name: incidents-api
+    app.kubernetes.io/part-of: sentinelflow
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: incidents-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: incidents-api
+        app.kubernetes.io/part-of: sentinelflow
+    spec:
+      containers:
+        - name: incidents-api
+          image: sentinelflow/incidents-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8084
+          env:
+            - name: HTTP_ADDR
+              value: ":8084"
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef: {name: sentinelflow-secrets, key: POSTGRES_DSN}
+          envFrom:
+            - configMapRef: {name: sentinelflow-config}
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: incidents-api
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/name: incidents-api
+    app.kubernetes.io/part-of: sentinelflow
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: incidents-api
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

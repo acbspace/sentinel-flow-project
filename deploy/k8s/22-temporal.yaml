@@ -1,0 +1,70 @@
+# Temporal, reusing the cluster's PostgreSQL for its own schema rather than
+# standing up a second datastore. auto-setup creates the schema and the default
+# namespace on first start and is idempotent afterwards.
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/name: temporal
+    app.kubernetes.io/part-of: sentinelflow
+spec:
+  selector:
+    app.kubernetes.io/name: temporal
+  ports:
+    - name: grpc
+      port: 7233
+      targetPort: 7233
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/name: temporal
+    app.kubernetes.io/part-of: sentinelflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: temporal
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: temporal
+        app.kubernetes.io/part-of: sentinelflow
+    spec:
+      containers:
+        - name: temporal
+          image: temporalio/auto-setup:1.27.2
+          ports:
+            - name: grpc
+              containerPort: 7233
+          env:
+            - name: DB
+              value: postgres12
+            - name: DB_PORT
+              value: "5432"
+            - name: POSTGRES_SEEDS
+              value: postgres
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: {name: sentinelflow-secrets, key: POSTGRES_USER}
+            - name: POSTGRES_PWD
+              valueFrom:
+                secretKeyRef: {name: sentinelflow-secrets, key: POSTGRES_PASSWORD}
+            - name: DBNAME
+              value: temporal
+            - name: VISIBILITY_DBNAME
+              value: temporal_visibility
+          readinessProbe:
+            tcpSocket:
+              port: 7233
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 20
+          resources:
+            requests: {cpu: 200m, memory: 512Mi}
+            limits: {cpu: "1", memory: 2Gi}

@@ -1,0 +1,37 @@
+# Non-secret configuration shared by every SentinelFlow service. Anything with a
+# credential in it lives in the Secret next door, not here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinelflow-config
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/part-of: sentinelflow
+data:
+  ENVIRONMENT: "kubernetes"
+  LOG_LEVEL: "info"
+
+  KAFKA_BROKERS: "kafka:9092"
+  KAFKA_TOPIC: "telemetry.events.v1"
+  KAFKA_CONSUMER_GROUP: "incident-engine-v1"
+
+  TEMPORAL_ADDRESS: "temporal:7233"
+  TEMPORAL_NAMESPACE: "default"
+
+  # Correlation (incident-engine)
+  CORRELATION_ENABLED: "true"
+  CORRELATION_INTERVAL: "15s"
+  CORRELATION_WINDOW: "60s"
+  CORRELATION_ERROR_RATE_THRESHOLD: "0.5"
+  CORRELATION_ERROR_RATE_MIN_EVENTS: "5"
+  CORRELATION_RESOLVE_AFTER: "5m"
+
+  # Alerting and remediation pollers
+  ALERT_POLL_INTERVAL: "10s"
+  REMEDIATION_POLL_INTERVAL: "10s"
+
+  # Telemetry. The services speak OTLP; point them at a collector in-cluster.
+  OTEL_TRACES_EXPORTER: "none"
+  OTEL_METRICS_EXPORTER: "none"
+  OTEL_EXPORTER_OTLP_ENDPOINT: ""
+  OTEL_METRIC_EXPORT_INTERVAL: "60s"

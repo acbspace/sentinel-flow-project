@@ -1,0 +1,98 @@
+# The consumer and correlation engine.
+#
+# Its HPA maxes out at 3 -- the topic's partition count -- because a consumer
+# group can never have more *working* members than partitions. Scaling past that
+# adds idle hot standbys, not throughput. Raising this ceiling means raising the
+# partition count first.
+apiVersion: v1
+kind: Service
+metadata:
+  name: incident-engine
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/name: incident-engine
+    app.kubernetes.io/part-of: sentinelflow
+spec:
+  selector:
+    app.kubernetes.io/name: incident-engine
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: incident-engine
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/name: incident-engine
+    app.kubernetes.io/part-of: sentinelflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: incident-engine
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: incident-engine
+        app.kubernetes.io/part-of: sentinelflow
+    spec:
+      # The consumer leaves its group cleanly and finishes in-flight commits on
+      # SIGTERM; give it room to do so before SIGKILL.
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: incident-engine
+          image: sentinelflow/incident-engine:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8081
+          env:
+            - name: HTTP_ADDR
+              value: ":8081"
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef: {name: sentinelflow-secrets, key: POSTGRES_DSN}
+          envFrom:
+            - configMapRef: {name: sentinelflow-config}
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: incident-engine
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/name: incident-engine
+    app.kubernetes.io/part-of: sentinelflow
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: incident-engine
+  minReplicas: 1
+  # Capped at the partition count. See the comment at the top of this file.
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+  behavior:
+    scaleDown:
+      # Every scale-in triggers a consumer-group rebalance, so do it reluctantly.
+      stabilizationWindowSeconds: 600

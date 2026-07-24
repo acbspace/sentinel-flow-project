@@ -1,0 +1,36 @@
+# Schema migrations as a Job, run before the applications.
+#
+# The migration runner takes an advisory lock and records applied versions, so
+# re-running it is safe -- which is what makes it correct to leave this Job in
+# place and re-apply it on every deploy.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sentinelflow-migrate
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/name: migrate
+    app.kubernetes.io/part-of: sentinelflow
+spec:
+  # A failing migration is a deploy-blocking problem; retry a few times in case
+  # PostgreSQL simply was not ready, then stop and make it visible.
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: migrate
+        app.kubernetes.io/part-of: sentinelflow
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: sentinelflow/migrate:latest
+          imagePullPolicy: IfNotPresent
+          args: ["up"]
+          env:
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef: {name: sentinelflow-secrets, key: POSTGRES_DSN}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}

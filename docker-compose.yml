@@ -1,0 +1,452 @@
+# SentinelFlow milestone 1: the full local pipeline.
+#
+# Start with `make up`. Dependency conditions mean the services come up in an
+# order that actually works: Kafka and PostgreSQL become healthy, the topic is
+# created, migrations run to completion, and only then do the applications start.
+
+name: sentinelflow
+
+services:
+  # ---- infrastructure --------------------------------------------------------
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set in .env}
+      # Deterministic collation keeps index behaviour identical across machines.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -q keeps the probe quiet; the exit status is what matters.
+      test: ["CMD-SHELL", "pg_isready -q -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  kafka:
+    image: apache/kafka:3.9.0
+    restart: unless-stopped
+    environment:
+      # Single-node KRaft: this broker is also the controller. Fine for local
+      # development; production would separate the roles and add replicas.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      # Containers connect to kafka:9092; the host connects to localhost:29092.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:${KAFKA_HOST_PORT:-29092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # A single broker cannot replicate; these must be 1 or topic creation fails.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Do not make the first consumer wait out a rebalance delay locally.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: ${KAFKA_PARTITIONS:-3}
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: sentinelflow-local-cluster
+    ports:
+      - "${KAFKA_HOST_PORT:-29092}:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 20s
+
+  # ---- one-shot setup jobs ---------------------------------------------------
+
+  # Auto-creation would give the topic whatever default partition count the
+  # broker has. Creating it explicitly makes the partitioning strategy visible
+  # and repeatable rather than incidental.
+  kafka-init:
+    image: apache/kafka:3.9.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists \
+          --topic "${KAFKA_TOPIC:-telemetry.events.v1}" \
+          --partitions "${KAFKA_PARTITIONS:-3}" \
+          --replication-factor 1
+        echo "topic ${KAFKA_TOPIC:-telemetry.events.v1} ready:"
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --describe --topic "${KAFKA_TOPIC:-telemetry.events.v1}"
+    restart: "no"
+
+  migrate:
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        SERVICE: migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+    command: ["up"]
+    restart: "no"
+
+  # ---- observability ---------------------------------------------------------
+
+  # The OpenTelemetry Collector. Every service has always been able to speak OTLP
+  # to it; set OTEL_TRACES_EXPORTER=otlp and OTEL_METRICS_EXPORTER=otlp in .env to
+  # route telemetry here instead of to stdout -- no application change required.
+  # It is behind a profile so the default `make up` stays lean:
+  #   docker compose --profile otel up -d otel-collector
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    profiles: ["otel"]
+    command: ["--config=/etc/otel/collector.yaml"]
+    volumes:
+      - ./build/otel/collector.yaml:/etc/otel/collector.yaml:ro
+    ports:
+      - "${OTEL_HTTP_PORT:-4318}:4318"   # OTLP/HTTP, what the services use
+      - "${OTEL_GRPC_PORT:-4317}:4317"   # OTLP/gRPC
+      - "${OTEL_PROM_PORT:-8889}:8889"   # Prometheus scrape endpoint
+    restart: unless-stopped
+
+  # ---- workflow engine -------------------------------------------------------
+
+  # Temporal drives the incident alert escalation workflows. auto-setup runs the
+  # server and creates its schema in the Postgres we already run, so there is no
+  # second datastore. Services connect via the client's dial-retry, so no
+  # healthcheck is needed here; depending on service_started is enough.
+  temporal:
+    image: temporalio/auto-setup:1.27.2
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_SEEDS: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PWD: ${POSTGRES_PASSWORD}
+      DBNAME: temporal
+      VISIBILITY_DBNAME: temporal_visibility
+    ports:
+      - "${TEMPORAL_GRPC_PORT:-7233}:7233"
+    restart: unless-stopped
+
+  # The Temporal Web UI, for watching the alert workflows run. Optional: it is
+  # behind a profile so a UI image problem never blocks the core stack. Start it
+  # with:  docker compose --profile ui up -d temporal-ui   (then open :8233)
+  temporal-ui:
+    image: temporalio/ui:2.34.0
+    profiles: ["ui"]
+    depends_on:
+      - temporal
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:${TEMPORAL_UI_PORT:-8233}
+    ports:
+      - "${TEMPORAL_UI_PORT:-8233}:8080"
+    restart: unless-stopped
+
+  # ---- applications ----------------------------------------------------------
+
+  ingestion-api:
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        SERVICE: ingestion-api
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      HTTP_ADDR: ":8080"
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-telemetry.events.v1}
+      MAX_BODY_BYTES: ${MAX_BODY_BYTES:-65536}
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-none}
+      OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-none}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_METRIC_EXPORT_INTERVAL: ${OTEL_METRIC_EXPORT_INTERVAL:-60s}
+    ports:
+      - "${INGESTION_API_PORT:-8080}:8080"
+    healthcheck:
+      # /ready, not /health: dependent services must wait until Kafka is
+      # actually reachable from this process, not merely until it has booted.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  incident-engine:
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        SERVICE: incident-engine
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      HTTP_ADDR: ":8081"
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-telemetry.events.v1}
+      KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-incident-engine-v1}
+      POSTGRES_DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      DB_RETRY_ATTEMPTS: ${DB_RETRY_ATTEMPTS:-5}
+      DB_RETRY_BASE_DELAY: ${DB_RETRY_BASE_DELAY:-100ms}
+      DB_RETRY_MAX_DELAY: ${DB_RETRY_MAX_DELAY:-5s}
+      CORRELATION_ENABLED: ${CORRELATION_ENABLED:-true}
+      CORRELATION_INTERVAL: ${CORRELATION_INTERVAL:-15s}
+      CORRELATION_WINDOW: ${CORRELATION_WINDOW:-60s}
+      CORRELATION_ERROR_RATE_THRESHOLD: ${CORRELATION_ERROR_RATE_THRESHOLD:-0.5}
+      CORRELATION_ERROR_RATE_MIN_EVENTS: ${CORRELATION_ERROR_RATE_MIN_EVENTS:-5}
+      CORRELATION_RESOLVE_AFTER: ${CORRELATION_RESOLVE_AFTER:-5m}
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-none}
+      OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-none}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_METRIC_EXPORT_INTERVAL: ${OTEL_METRIC_EXPORT_INTERVAL:-60s}
+    ports:
+      - "${INCIDENT_ENGINE_PORT:-8081}:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8081/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # The read side: incident queries, lifecycle transitions and the event read
+  # API. It shares the database with the engine but never touches Kafka.
+  incidents-api:
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        SERVICE: incidents-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      temporal:
+        condition: service_started
+    environment:
+      HTTP_ADDR: ":8084"
+      POSTGRES_DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      # With a Temporal address set, acknowledge/resolve also signal the alert
+      # workflow so escalation stops immediately.
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-none}
+      OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-none}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_METRIC_EXPORT_INTERVAL: ${OTEL_METRIC_EXPORT_INTERVAL:-60s}
+    ports:
+      - "${INCIDENTS_API_PORT:-8084}:8084"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8084/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # The alert worker: hosts the Temporal escalation workflow and the poller that
+  # starts one per open incident. Reads incidents, writes notifications, and
+  # reaches Kafka not at all.
+  alerting:
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        SERVICE: alerting
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      temporal:
+        condition: service_started
+    environment:
+      HTTP_ADDR: ":8085"
+      POSTGRES_DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      ALERT_POLL_INTERVAL: ${ALERT_POLL_INTERVAL:-10s}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-none}
+      OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-none}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_METRIC_EXPORT_INTERVAL: ${OTEL_METRIC_EXPORT_INTERVAL:-60s}
+    ports:
+      - "${ALERTING_PORT:-8085}:8085"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8085/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # The remediation worker: runs runbooks against open incidents, pausing at any
+  # step that needs a human. Separate from alerting on purpose -- paging someone
+  # and acting on production are different blast radii.
+  remediation:
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        SERVICE: remediation
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      temporal:
+        condition: service_started
+    environment:
+      HTTP_ADDR: ":8086"
+      POSTGRES_DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: incident-remediation
+      REMEDIATION_POLL_INTERVAL: ${REMEDIATION_POLL_INTERVAL:-10s}
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-none}
+      OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-none}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_METRIC_EXPORT_INTERVAL: ${OTEL_METRIC_EXPORT_INTERVAL:-60s}
+    ports:
+      - "${REMEDIATION_PORT:-8086}:8086"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8086/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # The incident dashboard. nginx serves the built React bundle and proxies /v1
+  # through to incidents-api, so the browser stays same-origin and the API needs
+  # no CORS handling.
+  dashboard:
+    build:
+      context: .
+      dockerfile: build/Dockerfile.web
+    restart: unless-stopped
+    depends_on:
+      incidents-api:
+        condition: service_healthy
+    ports:
+      - "${DASHBOARD_PORT:-3000}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  order-service:
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        SERVICE: order-service
+    restart: unless-stopped
+    depends_on:
+      ingestion-api:
+        condition: service_healthy
+    environment:
+      HTTP_ADDR: ":8082"
+      INGESTION_API_URL: http://ingestion-api:8080
+      # Each order also calls payment-service, producing a trace that spans two
+      # demo services, the ingestion API and the incident engine.
+      DOWNSTREAM_URL: http://payment-service:8083
+      TENANT_ID: ${TENANT_ID:-demo-tenant}
+      FAILURE_RATE: ${ORDER_FAILURE_RATE:-0.1}
+      MIN_LATENCY: ${MIN_LATENCY:-20ms}
+      MAX_LATENCY: ${MAX_LATENCY:-250ms}
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-none}
+      OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-none}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_METRIC_EXPORT_INTERVAL: ${OTEL_METRIC_EXPORT_INTERVAL:-60s}
+    ports:
+      - "${ORDER_SERVICE_PORT:-8082}:8082"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8082/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        SERVICE: payment-service
+    restart: unless-stopped
+    depends_on:
+      ingestion-api:
+        condition: service_healthy
+    environment:
+      HTTP_ADDR: ":8083"
+      INGESTION_API_URL: http://ingestion-api:8080
+      TENANT_ID: ${TENANT_ID:-demo-tenant}
+      FAILURE_RATE: ${PAYMENT_FAILURE_RATE:-0.2}
+      MIN_LATENCY: ${MIN_LATENCY:-20ms}
+      MAX_LATENCY: ${MAX_LATENCY:-250ms}
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-none}
+      OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-none}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_METRIC_EXPORT_INTERVAL: ${OTEL_METRIC_EXPORT_INTERVAL:-60s}
+    ports:
+      - "${PAYMENT_SERVICE_PORT:-8083}:8083"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8083/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  postgres-data:
+  kafka-data:

@@ -1,0 +1,95 @@
+# The ingestion front door. Stateless and the most load-sensitive component in
+# the system -- telemetry arrives fastest exactly when things are breaking -- so
+# it is the one with the widest autoscaling range.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingestion-api
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/name: ingestion-api
+    app.kubernetes.io/part-of: sentinelflow
+spec:
+  selector:
+    app.kubernetes.io/name: ingestion-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion-api
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/name: ingestion-api
+    app.kubernetes.io/part-of: sentinelflow
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ingestion-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ingestion-api
+        app.kubernetes.io/part-of: sentinelflow
+    spec:
+      containers:
+        - name: ingestion-api
+          image: sentinelflow/ingestion-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: HTTP_ADDR
+              value: ":8080"
+          envFrom:
+            - configMapRef: {name: sentinelflow-config}
+          # Liveness deliberately hits /health, not /ready: restarting a healthy
+          # process because Kafka is down turns a dependency outage into an
+          # outage of its own.
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ingestion-api
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/name: ingestion-api
+    app.kubernetes.io/part-of: sentinelflow
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ingestion-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      # Ingest bursts are the point; scale out quickly.
+      stabilizationWindowSeconds: 30
+    scaleDown:
+      # Scale in slowly, so a lull between bursts does not remove the capacity
+      # the next burst needs.
+      stabilizationWindowSeconds: 300

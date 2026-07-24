@@ -1,0 +1,14 @@
+.git
+.github
+.env
+*.md
+docs/
+bin/
+scripts/
+test/
+**/*_test.go
+
+# The web build happens inside the image; never ship the host's node_modules or
+# a stale dist into the build context.
+web/node_modules/
+web/dist/

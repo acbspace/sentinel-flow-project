@@ -1,0 +1,16 @@
+# Local environment: holds real credentials, never committed.
+.env
+
+# Build output
+/bin/
+/out/
+
+# Go test and coverage artifacts
+*.out
+coverage.html
+
+# Editor and OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

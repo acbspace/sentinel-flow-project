@@ -1,0 +1,34 @@
+{
+  "levels": [
+    {
+      "target": "primary on-call",
+      "ack_timeout": "2m",
+      "rotation": {
+        "contacts": [
+          {"name": "primary-a"},
+          {"name": "primary-b"}
+        ],
+        "start": "2026-01-05T00:00:00Z",
+        "shift": "168h"
+      }
+    },
+    {
+      "target": "secondary on-call",
+      "ack_timeout": "5m",
+      "rotation": {
+        "contacts": [
+          {"name": "secondary"}
+        ]
+      }
+    },
+    {
+      "target": "engineering manager",
+      "ack_timeout": "10m",
+      "rotation": {
+        "contacts": [
+          {"name": "eng-manager"}
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,66 @@
+# OpenTelemetry Collector configuration for the local stack.
+#
+# Every service already speaks OTLP over HTTP; this is the endpoint they were
+# always able to talk to. Setting OTEL_TRACES_EXPORTER=otlp turns it on with no
+# application change, which is the point of having built against the collector
+# protocol rather than a vendor SDK.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        # 0.0.0.0 so other containers on the compose network can reach it.
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  # Batching is the one processor that is always worth enabling: it amortises
+  # export overhead and is what every production pipeline starts with.
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+  # A hard ceiling so a telemetry burst during an incident cannot push the
+  # collector into an OOM kill -- the exact moment it is most needed.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 15
+
+exporters:
+  # The local default: render everything to the collector's own log. Swapping
+  # this for otlphttp/jaeger/tempo/prometheus is a config change here, not an
+  # application change anywhere.
+  debug:
+    verbosity: normal
+
+  # Prometheus scrape endpoint for metrics, so `curl :8889/metrics` shows the
+  # instruments the services define.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    send_timestamps: true
+    resource_to_telemetry_conversion:
+      enabled: true
+
+service:
+  # Surface the collector's own health so compose can gate on it.
+  extensions: [health_check]
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug, prometheus]
+
+  telemetry:
+    logs:
+      level: warn
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133

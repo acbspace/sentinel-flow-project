@@ -1,0 +1,208 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A new push to a PR makes the previous run's result irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.26"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Format and vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Verify formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt-formatted:"
+            echo "$unformatted"
+            echo "Run 'make fmt' and commit the result."
+            gofmt -d .
+            exit 1
+          fi
+          echo "All files are correctly formatted."
+
+      - name: Verify the module graph is tidy
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "::error::go.mod or go.sum is out of date. Run 'go mod tidy' and commit the result."
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # The integration test is behind a build tag, so the default vet never
+      # type-checks it. Vet it explicitly or it can rot unnoticed.
+      - name: go vet (integration build tag)
+        run: go vet -tags=integration ./...
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # The race detector is practical here: these tests are pure Go with no
+      # cgo, and the concurrency (the consume loop, the shared simulator) is
+      # exactly what a data race would corrupt.
+      - name: Run tests with the race detector
+        run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Report coverage
+        run: go tool cover -func=coverage.out | tail -20
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  build:
+    name: Build binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build every service
+        run: |
+          mkdir -p bin
+          for service in ingestion-api incident-engine incidents-api alerting remediation order-service payment-service migrate; do
+            echo "building $service"
+            CGO_ENABLED=0 go build -trimpath -o "bin/$service" "./cmd/$service"
+          done
+          ls -lh bin/
+
+  web:
+    name: Dashboard typecheck and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # ci, not install: the build must use exactly the committed lockfile.
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci --no-fund --no-audit
+
+      # `build` runs tsc --noEmit first, so this covers typechecking too; running
+      # it separately makes a type error report as its own failed step.
+      - name: Typecheck
+        working-directory: web
+        run: npm run typecheck
+
+      - name: Build
+        working-directory: web
+        run: npm run build
+
+  integration:
+    name: Integration test
+    runs-on: ubuntu-latest
+    # Only worth the infrastructure once the cheap checks agree.
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Create the local environment file
+        run: cp .env.example .env
+
+      # Only the infrastructure is needed: the test drives the ingestion handler
+      # and the consume loop in-process, which is what makes it a test of this
+      # code rather than of the container images.
+      - name: Start Kafka, PostgreSQL and Temporal
+        # Temporal waits on postgres being healthy via depends_on, so starting it
+        # here lets it set up its schema while we wait for the rest; the alerting
+        # test's client dial-retry covers any remaining startup lag.
+        run: docker compose up -d postgres kafka kafka-init temporal
+
+      - name: Wait for infrastructure to become healthy
+        run: |
+          for i in $(seq 1 60); do
+            postgres_state=$(docker inspect -f '{{.State.Health.Status}}' sentinelflow-postgres-1 2>/dev/null || echo starting)
+            kafka_state=$(docker inspect -f '{{.State.Health.Status}}' sentinelflow-kafka-1 2>/dev/null || echo starting)
+            echo "postgres=$postgres_state kafka=$kafka_state"
+            if [ "$postgres_state" = "healthy" ] && [ "$kafka_state" = "healthy" ]; then
+              echo "Infrastructure is ready."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Infrastructure did not become healthy in time."
+          docker compose ps
+          docker compose logs --tail=100
+          exit 1
+
+      - name: Run the end-to-end pipeline and alerting tests
+        env:
+          POSTGRES_DSN: postgres://sentinelflow:change-me-local-only@localhost:5432/sentinelflow?sslmode=disable
+          KAFKA_BROKERS: localhost:29092
+          TEMPORAL_ADDRESS: localhost:7233
+        run: go test -tags=integration -count=1 -timeout=10m -v ./test/integration/...
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker compose logs --tail=200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  docker:
+    name: Build container images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build every service image
+        run: |
+          for service in ingestion-api incident-engine incidents-api alerting remediation order-service payment-service migrate; do
+            echo "::group::building $service image"
+            docker build --build-arg "SERVICE=$service" -f build/Dockerfile -t "sentinelflow/$service:ci" .
+            echo "::endgroup::"
+          done
+
+      - name: Build the dashboard image
+        run: docker build -f build/Dockerfile.web -t sentinelflow/dashboard:ci .
