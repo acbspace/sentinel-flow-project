@@ -1,0 +1,54 @@
+-- Index the correlation engine's window query.
+--
+-- The engine evaluates every CORRELATION_INTERVAL (15s by default) with:
+--
+--     WHERE event_timestamp >= now() - window
+--
+-- Migration 0001 gave telemetry_events five indexes, but every one of them
+-- leads with a different column (tenant_id, service_name, event_type, severity,
+-- trace_id), so none can seek on a bare time range. The planner was left
+-- choosing between a full scan of one of those indexes and a sequential scan of
+-- the table, and it flipped between them as the table grew. Either way the cost
+-- of the system's most frequent query scaled with total rows stored rather than
+-- with the size of the window being asked about — on a table with no retention
+-- policy, that grows without bound.
+--
+-- Measured on a 3,000,000-row copy of this schema (30 days of events, 60-second
+-- window, PostgreSQL 16, buffers and timings from EXPLAIN (ANALYZE, BUFFERS)):
+--
+--   candidate                                    size     buffers   time
+--   ------------------------------------------   ------   -------   ---------
+--   baseline (the five 0001 indexes)             -         12,166   64.3 ms
+--   btree (event_timestamp DESC)                 64 MB          9    0.10 ms
+--   btree DESC INCLUDE (tenant, service, sev)    162 MB         4    0.11 ms
+--   BRIN (event_timestamp)                       32 kB         50    0.90 ms
+--
+-- The plain btree wins, and the two more interesting candidates both lose for
+-- reasons that only show up under realistic conditions:
+--
+-- The covering index looks best in that table — an index-only scan with zero
+-- heap fetches — but only because the measurement vacuumed immediately before
+-- running. An index-only scan needs the visibility map, and this query reads
+-- the newest rows in the table by definition: precisely the rows autovacuum has
+-- not marked all-visible yet. Measured against one minute of fresh inserts it
+-- degraded to 5,000 heap fetches, 5,066 buffers and 9.97 ms — marginally worse
+-- than the plain btree's 9.64 ms under the same conditions, for 2.5x the size.
+-- It pays for a promise it cannot keep here.
+--
+-- BRIN is astonishing on size (32 kB against 64 MB) and fine on perfectly
+-- append-ordered data, but it depends on physical row order correlating with
+-- event_timestamp. MAX_EVENT_BACKDATE (migration-era default: 7 days) permits
+-- late arrivals, and each one widens the min/max of whatever block range it
+-- lands in. Measured with 100,000 backdated arrivals spread over that 7-day
+-- allowance, BRIN went to 5,257 buffers and 55.8 ms with 258,362 rows discarded
+-- by index recheck — 5.6x slower than the btree on the same data. It is the
+-- right structure for immutable append-only history, not for a table that
+-- accepts late data.
+--
+-- Note on locking: the migration runner wraps each file in a transaction, so
+-- this cannot be CREATE INDEX CONCURRENTLY. On an empty or small table that is
+-- irrelevant. Against a large live table, build it out of band with
+-- CONCURRENTLY first — this statement is IF NOT EXISTS, so it will then be a
+-- no-op when the migration runs.
+CREATE INDEX IF NOT EXISTS telemetry_events_ts_idx
+    ON telemetry_events (event_timestamp DESC);

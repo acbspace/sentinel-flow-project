@@ -8,10 +8,10 @@
 
 ## Context
 
-Milestone 2 detects incidents, but an incident nobody is told about is worthless.
-Milestone 3 pages the on-call responder, waits for an acknowledgement, and
-escalates to the next responder if none comes — the loop a real incident platform
-lives or dies by.
+Correlation detects incidents, but an incident nobody is told about is worthless.
+Alerting pages the on-call responder, waits for an acknowledgement, and escalates
+to the next responder if none comes — the loop a real incident platform lives or
+dies by.
 
 The forces:
 
@@ -46,7 +46,7 @@ Concretely:
 - **Temporal, not a hand-rolled scheduler.** Durable timers, automatic retries,
   restart-survivability and signal-based rendezvous are exactly Temporal's
   purpose, and they are precisely forces 1 and 2. Writing a correct durable timer
-  wheel with at-most-once side effects is a project in itself; this milestone
+  wheel with at-most-once side effects is a project in itself; the design
   spends a dependency instead of re-deriving one.
 
 - **Workflow id = incident id** (`incident-alert-<uuid>`) with a
@@ -83,14 +83,14 @@ Concretely:
 ### A. A database-backed escalation poller, like the correlation loop
 
 Store escalation state in a table and advance it from a ticker, exactly as
-milestone 2's correlation engine does.
+the correlation engine does.
 
 *Rejected, though it was close.* It would fit the project's minimal-dependency
 ethos and reuse a proven pattern. But it means hand-building durable timers,
 at-most-once side-effect semantics across restarts, retry/backoff per
 notification, and a bespoke rendezvous for acknowledgement — the exact set of
 problems Temporal exists to solve, and each an opportunity to double-page someone
-at 3am. Milestone 2 already demonstrates the DB-polling pattern; spending it again
+at 3am. Correlation already demonstrates the DB-polling pattern; spending it again
 here would have bought consistency at the cost of correctness risk and would have
 taught the codebase nothing new.
 
@@ -101,7 +101,7 @@ and loses every in-flight escalation on restart.
 
 ### C. Delegate to a paging SaaS (PagerDuty, Opsgenie)
 
-*Rejected for this milestone, and it is the honest production answer.* A real
+*Rejected here, and it is the honest production answer.* A real
 deployment should hand escalation to a service that owns phone trees, mobile push
 and quiet hours. But this project exists to build the mechanism, not to integrate
 one; and an integration would be untestable here without credentials and a live
@@ -156,7 +156,7 @@ strictly harder than modelling the escalation as the sequential process it is.
 
 ## Validation
 
-Milestone 3 acceptance criteria:
+Acceptance criteria:
 
 - An open incident pages level 1 promptly. *Verified by
   `TestAlertingAcknowledgeStopsEscalation`'s first phase against a live Temporal,
@@ -176,7 +176,7 @@ Milestone 3 acceptance criteria:
 
 - Escalation stops being the only durable workflow in the system and Temporal is
   carrying a whole platform — at which point the dependency pays for itself many
-  times over, and remediation (milestone 4) should run on it too.
+  times over, and remediation should run on it too.
 - Conversely, if escalation stays this small and the operational cost of running
   Temporal outweighs it, alternative A becomes reasonable again.
 - The deployment gains a real paging provider, making alternative C the right

@@ -1,8 +1,8 @@
 // Command incident-engine consumes telemetry events from Kafka and stores the
-// normalized records in PostgreSQL.
+// normalized records in PostgreSQL, exactly once per event ID.
 //
-// Correlation rules are a later milestone; this binary's only job today is to
-// move events from the log into the database exactly once per event ID.
+// It also runs the correlation loop beside the consume loop, on its own cadence
+// over the same pool, which is what turns the stored event stream into incidents.
 package main
 
 import (

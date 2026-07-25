@@ -22,7 +22,7 @@ const (
 // Notifier delivers a notification and records it to the audit trail. Delivery is
 // always a structured log line, plus an optional webhook POST when a URL is
 // configured (globally, or per contact). Real Slack/email/PagerDuty integrations
-// are out of scope for this milestone; the webhook is the seam for them.
+// are out of scope here; the webhook is the seam for them.
 type Notifier struct {
 	recorder   NotificationRecorder
 	webhookURL string

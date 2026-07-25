@@ -131,7 +131,7 @@ func TestHandlerEmitsTelemetryOnSuccess(t *testing.T) {
 		t.Errorf("SchemaVersion = %q, want %q", ev.SchemaVersion, event.SchemaVersion10)
 	}
 
-	// Every attribute the milestone requires must be present.
+	// Every attribute the event contract requires must be present.
 	for _, key := range []string{"http_method", "http_route", "http_status_code", "latency_ms"} {
 		if _, ok := ev.Attributes[key]; !ok {
 			t.Errorf("attribute %q is missing; got %v", key, ev.Attributes)

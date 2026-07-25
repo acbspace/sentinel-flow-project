@@ -8,8 +8,8 @@
 
 ## Context
 
-Milestone 1 ends at normalized storage: events land in `telemetry_events` and
-nothing draws a conclusion from them. Milestone 2 adds the first reaction — it
+Ingestion ends at normalized storage: events land in `telemetry_events` and
+nothing draws a conclusion from them. Correlation is the first reaction — it
 watches the stream, decides when a service is unhealthy, and records that as an
 **incident** with a lifecycle an operator can act on.
 
@@ -37,7 +37,7 @@ The forces shaping this:
    but a person acknowledges it and a person (or a quiet period) resolves it. The
    model has to represent that progression honestly.
 
-6. **The stored data must become queryable.** Milestone 1 had no read path at all.
+6. **The stored data must become queryable.** Ingestion provides no read path at all.
    Incidents are worthless if the only way to see them is `psql`.
 
 ## Decision
@@ -159,9 +159,10 @@ the first correlation.
   one `CORRELATION_INTERVAL` after the condition crosses the threshold. Shortening
   the interval trades database load for faster reaction.
 - **The window query scans recent rows.** `WHERE event_timestamp >= since`
-  aggregated per service leans on the existing time-ordered indexes; at high
-  volume this wants a dedicated time index (or a rollup), which this milestone
-  does not add.
+  aggregated per service originally leaned on the existing time-ordered indexes,
+  none of which lead with `event_timestamp` and so none of which could seek on a
+  bare time range; migration 0005 adds a dedicated one. A rollup is the next step
+  if volume outgrows that.
 - **A permanently failing service re-opens forever.** Once resolved, a still-bad
   service opens a fresh incident on the next cycle. That is correct (the problem
   really is still happening) but can be noisy without a suppression/snooze
@@ -176,12 +177,12 @@ the first correlation.
   fingerprint, an incident's severity cannot change within its lifetime. If
   escalation ("warn that became critical") is wanted later, it needs an explicit
   model, not an implicit one.
-- The read API is intentionally unauthenticated at this milestone, consistent
+- The read API is intentionally unauthenticated, consistent
   with the rest of the stack living on a private Compose network.
 
 ## Validation
 
-Milestone 2 acceptance criteria:
+Acceptance criteria:
 
 - An error spike opens exactly one incident, and a repeat detection groups into
   it rather than duplicating. *Verified by

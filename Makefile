@@ -34,7 +34,7 @@ DEMO_REQUESTS ?= 20
 
 .PHONY: help
 help: ## Show the available commands
-	@echo "SentinelFlow — milestone 5"
+	@echo "SentinelFlow"
 	@echo
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'

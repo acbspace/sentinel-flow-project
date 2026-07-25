@@ -82,7 +82,7 @@ func TestDefaultCatalogIsValid(t *testing.T) {
 		t.Fatalf("embedded runbook has %d steps, want at least 2", len(rb.Steps))
 	}
 	// The dangerous step must be gated: this is the safety property the whole
-	// milestone rests on, so it is asserted rather than assumed.
+	// remediation design rests on, so it is asserted rather than assumed.
 	var sawApproval bool
 	for _, s := range rb.Steps {
 		if s.Kind == runbook.ActionWebhook && s.Mode != runbook.ModeApproval {

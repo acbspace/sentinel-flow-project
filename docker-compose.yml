@@ -1,4 +1,4 @@
-# SentinelFlow milestone 1: the full local pipeline.
+# SentinelFlow: the full local stack.
 #
 # Start with `make up`. Dependency conditions mean the services come up in an
 # order that actually works: Kafka and PostgreSQL become healthy, the topic is

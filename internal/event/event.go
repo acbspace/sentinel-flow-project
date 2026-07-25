@@ -16,7 +16,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// SchemaVersion10 is the only event schema version accepted in milestone 1.
+// SchemaVersion10 is the only event schema version currently accepted.
 // Breaking changes to the contract require a new version string here plus an
 // explicit decision about how long the old version stays supported.
 const SchemaVersion10 = "1.0"

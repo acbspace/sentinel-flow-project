@@ -1,7 +1,8 @@
 // Package engine consumes telemetry events from Kafka and persists them.
 //
-// Milestone 1 stops at normalized storage; incident correlation rules are a
-// later milestone and deliberately absent here.
+// It stops at normalized storage. Turning that stream into incidents belongs to
+// the correlate package, kept deliberately separate so a correlation failure
+// cannot stall the consume loop.
 package engine
 
 import (

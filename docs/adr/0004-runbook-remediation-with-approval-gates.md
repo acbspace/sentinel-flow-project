@@ -8,7 +8,7 @@
 
 ## Context
 
-Milestone 3 pages a human. Milestone 4 asks the harder question: what can the
+Alerting pages a human. Remediation asks the harder question: what can the
 platform do about an incident *itself*, and how do we make that safe?
 
 Automated remediation is the highest-risk feature in this project. Everything
@@ -85,7 +85,7 @@ Concretely:
 
 *Rejected* against force 1. The value is real — mean-time-to-recovery drops when
 nobody has to wake up — but it requires confidence in the detection rules that
-this system has not earned. Milestone 2 ships a single global error-rate
+this system has not earned. Correlation ships a single global error-rate
 threshold; letting that alone trigger production changes would be reckless. When
 detection is mature and per-service, individual steps can graduate to `auto`
 without any code change, because the mode is data.
@@ -105,7 +105,7 @@ unsafe and incoherent.
 
 ### D. Built-in Kubernetes / cloud actions
 
-*Rejected for this milestone.* It would make the demo more impressive and the
+*Rejected.* It would make the demo more impressive and the
 project far more dangerous: the platform would need cluster credentials, and a
 bug in a correlation rule could reach them. The webhook indirection keeps the
 permission boundary where it belongs. A deployment that wants real actions puts
@@ -153,7 +153,7 @@ couples those fates and muddies what the service is for.
 
 ## Validation
 
-Milestone 4 acceptance criteria:
+Acceptance criteria:
 
 - An unattended step runs on its own; a gated step waits. *Verified by
   `TestRemediationRunsAutoStepThenGatesOnApproval` against a live Temporal, and

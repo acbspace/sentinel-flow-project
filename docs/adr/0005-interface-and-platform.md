@@ -8,12 +8,12 @@
 
 ## Context
 
-Milestones 1–4 built a platform with no face. Everything it knows is reachable
-only by `curl` or `psql`, its telemetry goes to stdout, and it runs in exactly one
-place: Docker Compose on a laptop.
+Ingestion, correlation, alerting and remediation built a platform with no face.
+Everything it knows is reachable only by `curl` or `psql`, its telemetry goes to
+stdout, and it runs in exactly one place: Docker Compose on a laptop.
 
-Milestone 5 addresses all three: a dashboard, a real telemetry destination, and
-Kubernetes manifests. The forces are different from the earlier milestones —
+This decision addresses all three: a dashboard, a real telemetry destination, and
+Kubernetes manifests. The forces are different from the decisions above —
 nothing here is a distributed-systems correctness problem, and the risk is
 different too. The risk is **scope**: each of these three is a plausible project
 in its own right, and doing any of them badly would undo the credibility the
@@ -28,7 +28,7 @@ Specifically:
    a visible inconsistency.**
 3. **Kubernetes manifests are easy to over-engineer** into a templating system
    for one environment that does not exist yet.
-4. **Some things in the original milestone cannot be honestly demonstrated
+4. **Some things on the roadmap cannot be honestly demonstrated
    locally** — multi-region Kafka in particular.
 
 ## Decision
@@ -45,7 +45,7 @@ document the piece that cannot be honestly built rather than faking it.**
   dozen lines each. This answers force 1 directly.
 - **Polling, not websockets.** The backend exposes a REST read API and no push
   channel. A socket would be a fiction layered over the same requests, and adding
-  a push channel to the API was not what this milestone was for. Five-second
+  a push channel to the API was out of scope. Five-second
   refresh is adequate for an incident list; `usePolling` is the seam where
   server-sent events would land if sub-second liveness is ever needed.
 - **Same-origin by design.** nginx in production and Vite in development both
@@ -66,7 +66,7 @@ document the piece that cannot be honestly built rather than faking it.**
 - **The collector is optional, behind a Compose profile.** The services have
   always spoken OTLP; the collector is the endpoint they were built to talk to.
   Enabling it is two environment variables and no application change, which is
-  the payoff for having built against a vendor-neutral protocol in milestone 1.
+  the payoff for having built against a vendor-neutral protocol from the start.
   It stays off by default so `make up` remains lean and `make logs` keeps showing
   application logs rather than span dumps.
 
@@ -88,7 +88,7 @@ document the piece that cannot be honestly built rather than faking it.**
 
 ### Multi-region Kafka — documented, not built
 
-The original milestone listed multi-region Kafka. **It is not implemented, and it
+Multi-region Kafka was on the roadmap. **It is not implemented, and it
 should not be.** Doing it credibly means MirrorMaker 2 or Cluster Linking, a
 second cluster, a story for offset translation across regions, and a decision
 about whether the incident engine is active/active or active/passive. None of
@@ -139,16 +139,16 @@ single instantiation.
 
 ### Positive
 
-- **The platform finally has a face**, and the approval gate from milestone 4 has
+- **The platform finally has a face**, and the approval gate has
   somewhere natural to live: a button, next to the evidence for the decision.
 - **The frontend cannot rot silently** — CI typechecks it in strict mode and
   builds the image.
 - **Telemetry has a real destination** with no application change, validating the
-  vendor-neutral choice made in milestone 1.
+  vendor-neutral choice made at the start.
 - **The system can run on a cluster**, with the scaling constraints written down
   where an operator will find them.
 - **The dependency budget stayed honest**: two runtime dependencies for the
-  dashboard, and the Go module gained nothing at all in this milestone.
+  dashboard, and the Go module gained nothing at all.
 
 ### Negative
 
@@ -175,11 +175,11 @@ single instantiation.
 - The dashboard typechecks in strict mode and builds. *Verified by `npm run
   build` locally and the `web` CI job.*
 - Every manifest parses and carries `apiVersion`, `kind` and `metadata.name`.
-  *Verified during this milestone; 23 documents.*
+  *Verified; 23 documents.*
 - The Compose stack still resolves with the dashboard, collector and remediation
   services added. *Verified by `docker compose config`.*
 - Enabling the collector requires no application change. *Follows from the OTLP
-  exporter path implemented in milestone 1 and exercised by `obs` tests.*
+  exporter path built into every service and exercised by `obs` tests.*
 
 ## Revisit this decision if
 
@@ -191,7 +191,7 @@ single instantiation.
 - Sub-second liveness is genuinely needed, which is a backend change (server-sent
   events) before it is a frontend one.
 - The project ever needs to be genuinely multi-region, at which point §15.4 stops
-  being analysis and becomes a milestone.
+  being analysis and becomes work.
 
 ## References
 

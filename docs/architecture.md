@@ -1,24 +1,22 @@
 # SentinelFlow architecture
 
 This document explains how the pipeline works and, more importantly, why it works
-the way it does. Sections 1–11 cover milestone 1 — the ingestion pipeline: the
-event flow, the Kafka partitioning and offset strategy, the idempotency
-guarantee, what happens when each component fails, and why the database is
-indexed the way it is. Section 12 covers milestone 2 — correlation and the
-incident lifecycle: how the stored stream becomes incidents, how duplicates are
-collapsed, and how an incident moves from open to resolved. Section 13 covers
-milestone 3 — alerting: how an open incident pages the on-call responder,
-escalates when unacknowledged, and stops the moment someone takes ownership.
-Section 14 covers milestone 4 — remediation: what the platform may do about an
-incident itself, and the approval gates that bound it. Section 15 covers
-milestone 5 — the dashboard, the telemetry collector, the Kubernetes manifests,
-and an honest analysis of the multi-region question.
+the way it does. Sections 1–11 cover the ingestion pipeline: the event flow, the
+Kafka partitioning and offset strategy, the idempotency guarantee, what happens
+when each component fails, and why the database is indexed the way it is.
+Section 12 covers correlation and the incident lifecycle: how the stored stream
+becomes incidents, how duplicates are collapsed, and how an incident moves from
+open to resolved. Section 13 covers alerting: how an open incident pages the
+on-call responder, escalates when unacknowledged, and stops the moment someone
+takes ownership. Section 14 covers remediation: what the platform may do about an
+incident itself, and the approval gates that bound it. Section 15 covers the
+dashboard, the telemetry collector, the Kubernetes manifests, and an honest
+analysis of the multi-region question.
 
-Scope note: the roadmap is complete through milestone 5. What is deliberately
-not here is named rather than implied: no auth anywhere, no real paging or
-remediation providers (both sit behind webhooks), no frontend tests, and no
-multi-region deployment — see §15.4 for why that last one is analysis rather
-than code.
+What is deliberately not here is named rather than implied: no auth anywhere, no
+real paging or remediation providers (both sit behind webhooks), no frontend
+tests, and no multi-region deployment — see §15.4 for why that last one is
+analysis rather than code.
 
 ---
 
@@ -263,14 +261,14 @@ The consistent rule across all of these: **an error is either retried, or report
 loudly, or explicitly and visibly dropped with a documented reason.** Nothing is
 swallowed.
 
-### Failure mode this milestone does not handle well
+### Failure mode this design does not handle well
 
 Scenario 5 (a permanent database rejection) currently stalls the partition: the
 offset is never committed, so the engine will restart and hit the same record
 forever. That is the correct default — silently skipping a row that *should* have
 been storable would hide a real bug — but it means a single malformed-but-valid
 event can halt a partition until an operator intervenes. A dead-letter topic is
-the fix, and it is on the roadmap rather than in this milestone.
+the fix, and it is on the roadmap rather than built.
 
 ---
 
@@ -303,9 +301,9 @@ without trace context all share the empty string, and indexing thousands of
 identical keys costs storage and write throughput while helping no query.
 
 `attributes` is `JSONB` rather than a wide column set, so a producer adding a new
-attribute never requires a migration. It is deliberately **not** indexed in this
-milestone: a GIN index on JSONB is expensive to maintain on write, and no query
-here filters on attributes yet. When one does, `CREATE INDEX ... USING GIN
+attribute never requires a migration. It is deliberately **not** indexed: a GIN
+index on JSONB is expensive to maintain on write, and no query here filters on
+attributes yet. When one does, `CREATE INDEX ... USING GIN
 (attributes jsonb_path_ops)` is the answer.
 
 The `severity` `CHECK` constraint duplicates the application-level validation.
@@ -348,17 +346,17 @@ than span dumps. That is a demo-ergonomics choice, not a limitation.
 
 ---
 
-## 10. Trade-offs made for this milestone
+## 10. Trade-offs made in the ingestion pipeline
 
 | Decision | Rationale | When to revisit |
 |---|---|---|
 | **JSON on the wire, not Avro or Protobuf** | Readable with `kcat` and `curl`, no schema registry to run, no code generation. | When throughput or schema governance matters. `schema_version` and the content-type header are the seam. |
 | **Synchronous produce (`ProduceSync`)** | A `202` genuinely means durable. Async batching would be faster but would make the API lie about durability. | If ingest throughput becomes the bottleneck, batch with an explicit durability contract change. |
 | **Strict decoding (unknown fields rejected)** | A misspelled field at the ingestion boundary is a producer bug, and silently ignoring it hides it. | If third-party producers need forward compatibility, relax to ignoring unknown fields and lean on `schema_version`. |
-| **Poison messages dropped, not dead-lettered** | A dead-letter topic is real infrastructure with its own operational story. Logging loudly is honest for one milestone. | Immediately, if this ran in production. It is the first roadmap item. |
+| **Poison messages dropped, not dead-lettered** | A dead-letter topic is real infrastructure with its own operational story. Logging loudly is the honest interim answer. | Immediately, if this ran in production. It is the first roadmap item. |
 | **Whole-batch commit, not per-record** | One commit per batch instead of per record; a mid-batch failure replays the whole batch, which is harmless because inserts are idempotent. | If batches grow large enough that replaying one is expensive. |
 | **Sequential record processing** | Preserves per-partition ordering and keeps the code obvious. Parallelism belongs across partitions, not within one. | Add engine replicas first; that is what partitions are for. |
-| **No incident correlation** | Milestone 1 is explicitly about getting events durably stored. Correlation on an unreliable pipeline would be worthless. | Milestone 2. |
+| **Storage before correlation** | Getting events durably stored came first; correlation over an unreliable pipeline would be worthless. | Already revisited — see §12. |
 | **Single-node Kafka, replication factor 1** | Local development. A broker failure loses data. | Any non-local deployment needs RF ≥ 3 and `min.insync.replicas=2`. |
 | **No authentication anywhere** | The whole stack is on a private Compose network with no external exposure. | Before anything is exposed. mTLS or SASL for Kafka, an auth layer on the ingestion API. |
 | **Tenant isolation by convention** | `tenant_id` is a column and a partition key, not a security boundary. | When multi-tenancy is real: row-level security, or separate schemas. |
@@ -378,23 +376,24 @@ cmd/<service>/main.go     wiring only: config → telemetry → dependencies →
   └── internal/store      pgx pool, the insert, retryable-error classification
   └── internal/ingest     the HTTP handler
   └── internal/engine     the processor and the consume loop
-  └── internal/incident   the incident domain: lifecycle, fingerprint (m2)
-  └── internal/correlate  rules, the windowed evaluator, the ticker loop (m2)
-  └── internal/incidentapi the read/lifecycle HTTP handler (m2)
-  └── internal/oncall     escalation policy and on-call rotation (m3)
-  └── internal/alerting   the Temporal workflow, activities, starter (m3)
-  └── internal/runbook    runbook catalog: matchers, steps, approval modes (m4)
-  └── internal/remediate  the remediation workflow, executor, starter (m4)
-deploy/k8s/                 Kubernetes manifests (m5)
-web/                        React dashboard, 2 runtime dependencies (m5)
-build/otel/                 OpenTelemetry Collector config (m5)
+  └── internal/incident   the incident domain: lifecycle, fingerprint
+  └── internal/correlate  rules, the windowed evaluator, the ticker loop
+  └── internal/incidentapi the read/lifecycle HTTP handler
+  └── internal/oncall     escalation policy and on-call rotation
+  └── internal/alerting   the Temporal workflow, activities, starter
+  └── internal/runbook    runbook catalog: matchers, steps, approval modes
+  └── internal/remediate  the remediation workflow, executor, starter
+  └── internal/bench      the load generator's harness and report
+deploy/k8s/                 Kubernetes manifests
+web/                        React dashboard, 2 runtime dependencies
+build/otel/                 OpenTelemetry Collector config
   └── internal/demo       simulator, emitter, demo handler, service bootstrap
   └── internal/migrate    migration runner
   └── migrations          embedded SQL
 ```
 
 Dependencies point one way, toward `event`, which imports nothing from this
-project. There are no cycles. The milestone 2 packages slot in above `store`:
+project. There are no cycles. The incident packages slot in above `store`:
 `incident` depends only on `event`, `correlate` and `incidentapi` depend on
 `store` and `incident`, exactly as `engine` and `ingest` do.
 
@@ -422,10 +421,10 @@ always receives its providers as explicit parameters.
 
 ---
 
-## 12. Correlation and the incident lifecycle (milestone 2)
+## 12. Correlation and the incident lifecycle
 
-Milestone 1 stops at stored events. Milestone 2 adds the first *reaction*: a
-correlation engine that watches the stored stream, opens an **incident** when a
+Ingestion stops at stored events. Correlation is the first *reaction*: an engine
+that watches the stored stream, opens an **incident** when a
 service is unhealthy, groups repeat detections into that one incident, and tracks
 it through a lifecycle until it is resolved. A separate read API exposes the
 result. The full rationale — including the alternatives that were rejected — is
@@ -551,27 +550,27 @@ rather than by rule bookkeeping.
 `incidents-api` (port 8084) is a separate, read-mostly service — deliberately not
 bolted onto the write-only ingestion API. It serves incident queries, the
 acknowledge/resolve transitions, and a filtered read API over stored events (the
-query path milestone 1 lacked entirely). It shares the database with the engine
+query path the write-only front door lacks entirely). It shares the database with the engine
 but never touches Kafka. Query parameters outside the closed vocabularies (an
 unknown status or severity, a non-RFC3339 time bound, a non-UUID id) are rejected
 as `400`s rather than silently returning nothing or failing deep in the database.
 
-### 12.6 What this milestone still does not do
+### 12.6 What correlation still does not do
 
 | Not done | Consequence | Where it goes |
 |---|---|---|
-| **Notification / on-call routing** | An incident opens, but nobody is paged. | Milestone 3. |
-| **Remediation** | No automated action is taken. | Milestone 4. |
 | **Per-service thresholds** | One global error-rate rule; a service with a high baseline has no override. | A rules table (ADR 0002, alt. E). |
 | **Suppression / snooze** | A permanently broken service re-opens an incident every cycle after each resolve. | Correct but noisy; needs a snooze model. |
-| **A dedicated time index for the window scan** | The per-cycle aggregate leans on the existing time-ordered indexes; fine at demo scale. | A time index or rollup when volume demands it. |
 | **Auth on the read API** | `incidents-api` is open on the private network. | Before any external exposure. |
+
+Paging and remediation are covered in §13 and §14. The window scan had no index
+that could serve it until migration 0005 added one — see §8.
 
 ---
 
-## 13. Alerting and escalation (milestone 3)
+## 13. Alerting and escalation
 
-Milestone 2 detects incidents; milestone 3 tells someone. When an incident opens,
+Correlation detects incidents; alerting tells someone. When an incident opens,
 a **Temporal workflow** pages the on-call responder, waits for an
 acknowledgement, and escalates to the next responder if none arrives. The
 rationale and rejected alternatives are in
@@ -585,11 +584,11 @@ minutes, page again, and stop the instant someone takes ownership. It must
 survive restarts (an escalation lost to a redeploy is worse than none, because it
 is silently trusted) and it must page each level exactly once. Durable timers,
 replay-safe state and signal-based rendezvous are precisely what Temporal
-provides, so this milestone spends a dependency rather than re-deriving a
+provides, so the design spends a dependency here rather than re-deriving a
 scheduler.
 
 The trade is real and deliberate: Temporal is the heaviest thing this project
-runs. It is worth it here and nowhere else so far — correlation (milestone 2)
+runs. It is worth it here and nowhere else so far — correlation
 deliberately uses a plain database poller, because a windowed aggregate is not a
 durable process.
 
@@ -622,7 +621,7 @@ treats as success. So:
   harmlessly-rejected start, not a second page);
 - "one alert workflow per incident" is a **server-side guarantee**, not
   application locking;
-- a recurrence is a *new* incident with a new id (milestone 2's partial index), so
+- a recurrence is a *new* incident with a new id (the partial unique index in §12), so
   it correctly gets its own workflow.
 
 ### 13.4 The escalation loop
@@ -667,22 +666,22 @@ arithmetic — deterministic, so it is safe to call inside a workflow, and trivi
 testable. Policies are JSON with a default embedded in the binary, overridable
 with `ESCALATION_POLICY_PATH`.
 
-### 13.7 What this milestone does not do
+### 13.7 What alerting does not do
 
 | Not done | Consequence | Where it goes |
 |---|---|---|
 | **Real Slack / email / PagerDuty delivery** | "Paged" means recorded, logged, and webhooked if configured. | The webhook sink is the seam; a real provider is ADR 0003 alternative C. |
-| **Quiet hours, snooze, alert grouping** | Every open incident pages. | Needs a suppression model, alongside milestone 2's snooze gap. |
+| **Quiet hours, snooze, alert grouping** | Every open incident pages. | Needs a suppression model, alongside the snooze gap in §12.6. |
 | **Calendar-based on-call** | Only the fixed-shift rotation exists. | A schedule service, or delegation to a paging provider. |
-| **Automated remediation** | A human still fixes it. | Milestone 4. |
+| **Automated remediation** | A human still fixes it. | Covered in §14. |
 | **Auth on the alerting probe surface** | As with every other service, private network only. | Before external exposure. |
 
 ---
 
-## 14. Remediation and approval gates (milestone 4)
+## 14. Remediation and approval gates
 
-Milestone 3 pages a human. Milestone 4 asks what the platform may do *itself* —
-the highest-risk feature here, since everything before it only observed. The
+Alerting pages a human. Remediation asks what the platform may do *itself* — the
+highest-risk capability here, since everything else only observes. The
 design is therefore organised around refusal rather than action. Full rationale in
 [ADR 0004](adr/0004-runbook-remediation-with-approval-gates.md).
 
@@ -758,7 +757,7 @@ already done would be a lie — the outcome appears in the audit trail. Deciding
 when nothing is pending is a **409**, because the incident exists but there is
 nothing to decide on.
 
-### 14.6 What this milestone does not do
+### 14.6 What remediation does not do
 
 | Not done | Consequence | Where it goes |
 |---|---|---|
@@ -770,11 +769,11 @@ nothing to decide on.
 
 ---
 
-## 15. Interface and platform (milestone 5)
+## 15. Interface and platform
 
-Milestones 1–4 built a platform with no face: everything it knew was reachable
-only by `curl` or `psql`, its telemetry went to stdout, and it ran in exactly one
-place. Milestone 5 adds a dashboard, a real telemetry destination, and Kubernetes
+Everything above is a platform with no face: what it knows is reachable only by
+`curl` or `psql`, its telemetry goes to stdout, and it runs in exactly one place.
+This section covers the dashboard, a real telemetry destination, and Kubernetes
 manifests. Rationale and rejected alternatives in
 [ADR 0005](adr/0005-interface-and-platform.md).
 
@@ -810,7 +809,7 @@ is formatting and conditional rendering.
 ### 15.2 Telemetry finally has somewhere to go
 
 The OpenTelemetry Collector runs behind an optional Compose profile. Every
-service has spoken OTLP since milestone 1, so switching from stdout to the
+service has spoken OTLP from the start, so switching from stdout to the
 collector is two environment variables and **no application change** — the payoff
 for having built against a vendor-neutral protocol rather than a vendor SDK.
 
@@ -842,7 +841,7 @@ open, page and escalate as normal.
 
 ### 15.4 Multi-region Kafka — the analysis, not a prop
 
-The milestone listed multi-region Kafka. **It is deliberately not implemented**,
+Multi-region Kafka was on the roadmap. **It is deliberately not implemented**,
 because it cannot be demonstrated honestly on one machine, and a Compose file
 with two single-broker clusters labelled `us-east` and `eu-west` would be
 theatre. What the work actually involves:
@@ -855,7 +854,7 @@ theatre. What the work actually involves:
   translated offset — approximately. Any failover therefore reprocesses some
   events, which this system already tolerates: the `event_id` primary key makes
   reprocessing a no-op, and the incident fingerprint makes duplicate detection
-  idempotent. **The idempotency built in milestone 1 is what would make a
+  idempotent. **The idempotency built into ingestion is what would make a
   multi-region failover survivable**, and that is the genuinely interesting
   observation.
 - **Active/active or active/passive.** Two incident engines consuming mirrored
@@ -872,7 +871,7 @@ The conclusion is that "multi-region Kafka" is not one feature but a set of
 coupled decisions about where state lives, and the honest deliverable at this
 stage is that analysis rather than a demo that implies more than it does.
 
-### 15.5 What this milestone does not do
+### 15.5 What the interface and platform work does not do
 
 | Not done | Consequence | Where it goes |
 |---|---|---|
@@ -880,4 +879,4 @@ stage is that analysis rather than a demo that implies more than it does.
 | **Manifests validated against a live API server** | They parse and are faithful, but no job applies them. | A `kind` cluster in CI. |
 | **Auth anywhere** | The dashboard approves as `actor=dashboard`. | Auth arrives across the whole stack at once, or not at all. |
 | **Charts over the event stream** | `GET /v1/events` supports it; nothing visualises it. | Future dashboard work. |
-| **Multi-region anything** | Analysis only — see §15.4. | Its own milestone, if the project ever needs it. |
+| **Multi-region anything** | Analysis only — see §15.4. | A project of its own, if this ever needs it. |

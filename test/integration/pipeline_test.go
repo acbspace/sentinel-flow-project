@@ -1,6 +1,6 @@
 //go:build integration
 
-// Package integration exercises the whole milestone 1 pipeline against real
+// Package integration exercises the whole ingestion pipeline against real
 // infrastructure: an HTTP request to the ingestion handler must travel through
 // Kafka and arrive as a row in PostgreSQL, and a redelivery of the same event
 // must not create a second row.
@@ -308,7 +308,7 @@ func (p *pipeline) countEvent(ctx context.Context, t *testing.T, eventID string)
 	return count
 }
 
-// TestPipelinePersistsIngestedEvent covers the milestone's core promise: an
+// TestPipelinePersistsIngestedEvent covers the pipeline's core promise: an
 // event accepted over HTTP is published to Kafka, consumed by the engine, and
 // stored in PostgreSQL with its fields intact.
 func TestPipelinePersistsIngestedEvent(t *testing.T) {

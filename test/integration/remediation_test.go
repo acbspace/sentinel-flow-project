@@ -1,6 +1,6 @@
 //go:build integration
 
-// This file exercises milestone 4 against real PostgreSQL and Temporal: a
+// This file exercises remediation against real PostgreSQL and Temporal: a
 // runbook's unattended step runs on its own, its gated step waits for a human,
 // and approving or rejecting that step decides whether anything else happens.
 package integration
@@ -190,7 +190,7 @@ func (h *remediationHarness) stepStatus(ctx context.Context, t *testing.T, incid
 	return "", false
 }
 
-// TestRemediationRunsAutoStepThenGatesOnApproval covers the milestone's core
+// TestRemediationRunsAutoStepThenGatesOnApproval covers remediation's core
 // promise: the safe step runs unattended, the dangerous one stops and waits, and
 // it only proceeds once a human approves.
 func TestRemediationRunsAutoStepThenGatesOnApproval(t *testing.T) {

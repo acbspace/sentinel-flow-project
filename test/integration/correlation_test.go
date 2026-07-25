@@ -1,6 +1,6 @@
 //go:build integration
 
-// This file exercises milestone 2 against real PostgreSQL: the correlation
+// This file exercises correlation against real PostgreSQL: the correlation
 // engine reading window stats, the partial-unique-index dedup in UpsertOpen, the
 // guarded lifecycle transitions, and auto-resolution. Each test isolates itself
 // with a unique tenant id so a run never sees another run's (or the demo's)

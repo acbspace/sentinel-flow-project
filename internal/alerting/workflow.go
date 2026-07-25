@@ -41,8 +41,8 @@ const (
 // WorkflowID is the deterministic Temporal workflow id for an incident's alert.
 // Deriving it from the incident id makes "one alert workflow per incident" a
 // Temporal guarantee, and lets the incidents-api address the workflow to signal
-// it without any shared lookup table. A recurrence is a new incident (new id, per
-// milestone 2), so it gets its own workflow.
+// it without any shared lookup table. A recurrence is a new incident with a new
+// id, so it gets its own workflow.
 func WorkflowID(incidentID string) string {
 	return "incident-alert-" + incidentID
 }

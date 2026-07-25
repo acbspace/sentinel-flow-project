@@ -26,8 +26,8 @@ The forces shaping the design:
    platform is degraded. Observability that can take down the thing it observes
    is worse than no observability.
 
-4. **The number of consumers will grow.** Milestone 1 stores events. Later
-   milestones add correlation, alert routing, remediation workflows, and
+4. **The number of consumers will grow.** Storing events is only the first consumer. Later
+   work adds correlation, alert routing, remediation workflows, and
    analytics. Each is a different consumer of the same event stream, with
    different latency needs and different failure modes.
 
@@ -40,7 +40,7 @@ The forces shaping the design:
 **SentinelFlow is built around a durable, replayable event log (Apache Kafka) as
 the system of record for ingested telemetry.**
 
-Concretely, for milestone 1:
+Concretely, for the ingestion pipeline:
 
 - The ingestion API validates events and publishes them to `telemetry.events.v1`.
   It waits for the broker acknowledgement before returning `202 Accepted`, so
@@ -139,7 +139,7 @@ built-in delay defeat the purpose, and batch windows interact badly with bursts.
 
 ## Validation
 
-The milestone 1 acceptance criteria for this decision:
+The acceptance criteria for this decision:
 
 - An event accepted with `202` is durable in Kafka before the response is sent.
   *Verified by the synchronous produce path and the `503` behaviour when the

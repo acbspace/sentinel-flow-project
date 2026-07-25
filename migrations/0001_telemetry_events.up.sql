@@ -1,6 +1,6 @@
 -- Telemetry events are the single normalized record of everything the pipeline
--- has ingested. Milestone 1 stores them; later milestones correlate them into
--- incidents.
+-- has ingested. This table stores them; the incidents table correlates them into
+-- episodes.
 
 CREATE TABLE IF NOT EXISTS telemetry_events (
     -- The producer-supplied event ID is the primary key rather than a serial

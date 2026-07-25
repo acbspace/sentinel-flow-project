@@ -69,8 +69,8 @@ func (p *Providers) Shutdown(ctx context.Context) error {
 
 // Setup builds the tracer and meter providers described by cfg.
 //
-// Milestone 1 defaults to the stdout exporters so the pipeline is visible with
-// no extra infrastructure. Setting OTEL_EXPORTER_OTLP_ENDPOINT and switching the
+// The stdout exporters are the default so the pipeline is visible with no extra
+// infrastructure. Setting OTEL_EXPORTER_OTLP_ENDPOINT and switching the
 // exporters to "otlp" points the same code at an OpenTelemetry Collector; no
 // application change is needed to adopt one.
 //

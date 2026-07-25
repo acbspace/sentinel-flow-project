@@ -1,6 +1,6 @@
 //go:build integration
 
-// This file exercises milestone 3 against real PostgreSQL and a real Temporal
+// This file exercises alerting against real PostgreSQL and a real Temporal
 // server: the alert workflow pages the on-call responder, escalates when
 // unacknowledged, and stops the moment the incident is acknowledged. Each test
 // isolates itself with a unique tenant and Temporal task queue. It uses a policy
