@@ -14,16 +14,23 @@ import (
 
 // insertEventSQL is the single write path for telemetry.
 //
-// ON CONFLICT DO NOTHING on the event_id primary key is the idempotency
-// mechanism for the whole pipeline: because Kafka delivery is at-least-once, the
-// engine will occasionally see a record it has already stored, and the database
-// is the one place that can decide that question atomically under concurrency.
+// ON CONFLICT DO NOTHING on the primary key is the idempotency mechanism for the
+// whole pipeline: because Kafka delivery is at-least-once, the engine will
+// occasionally see a record it has already stored, and the database is the one
+// place that can decide that question atomically under concurrency.
+//
+// The conflict target is (event_timestamp, event_id), not event_id alone,
+// because telemetry_events is range-partitioned on event_timestamp and
+// PostgreSQL requires the partition key in every unique constraint. This still
+// collapses redeliveries: a replayed Kafka record is byte-identical, so it
+// carries the same timestamp, routes to the same partition, and conflicts. See
+// migration 0006 for the guarantee this narrows and why that is acceptable.
 const insertEventSQL = `
 INSERT INTO telemetry_events (
     event_id, schema_version, tenant_id, service_name, environment,
     event_type, severity, event_timestamp, trace_id, attributes, received_at
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-ON CONFLICT (event_id) DO NOTHING`
+ON CONFLICT (event_timestamp, event_id) DO NOTHING`
 
 const countEventsSQL = `SELECT count(*) FROM telemetry_events`
 

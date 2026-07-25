@@ -8,7 +8,7 @@ SHELL := /bin/bash
 # Every executable lives in cmd/<name>. SERVICES are the deployable ones: they
 # get built into ./bin, get a container image, and have a manifest. Keep this
 # list in sync with that layout.
-SERVICES := ingestion-api incident-engine incidents-api alerting remediation order-service payment-service migrate
+SERVICES := ingestion-api incident-engine incidents-api alerting remediation janitor order-service payment-service migrate
 
 # Development-only executables in cmd/. They are deliberately absent from
 # SERVICES: a load generator has no place in a deployed image, and adding one
@@ -28,6 +28,7 @@ INGESTION_URL ?= http://localhost:8080
 INCIDENTS_URL ?= http://localhost:8084
 ALERTING_URL ?= http://localhost:8085
 REMEDIATION_URL ?= http://localhost:8086
+JANITOR_URL ?= http://localhost:8087
 ORDER_URL ?= http://localhost:8082
 PAYMENT_URL ?= http://localhost:8083
 DEMO_REQUESTS ?= 20
@@ -133,7 +134,8 @@ wait: ## Block until every application service reports ready
 		   curl -fsS http://localhost:8081/ready >/dev/null 2>&1 && \
 		   curl -fsS $(INCIDENTS_URL)/ready >/dev/null 2>&1 && \
 		   curl -fsS $(ALERTING_URL)/ready >/dev/null 2>&1 && \
-		   curl -fsS $(REMEDIATION_URL)/ready >/dev/null 2>&1; then \
+		   curl -fsS $(REMEDIATION_URL)/ready >/dev/null 2>&1 && \
+		   curl -fsS $(JANITOR_URL)/ready >/dev/null 2>&1; then \
 			echo "stack is ready"; \
 			exit 0; \
 		fi; \
@@ -233,6 +235,19 @@ bench: ## Measure the HTTP paths and print the README's benchmark table (require
 		-workers=$(BENCH_WORKERS) \
 		-duration=$(BENCH_DURATION) \
 		-warmup=$(BENCH_WARMUP)
+
+.PHONY: partitions
+partitions: ## Show the telemetry_events partitions, their size and row counts
+	@$(COMPOSE) exec -T postgres psql -U $${POSTGRES_USER:-sentinelflow} -d $${POSTGRES_DB:-sentinelflow} -c "\
+		SELECT child.relname AS partition, \
+		       pg_size_pretty(pg_total_relation_size(child.oid)) AS size, \
+		       child.reltuples::bigint AS approx_rows \
+		FROM pg_inherits \
+		JOIN pg_class parent ON parent.oid = pg_inherits.inhparent \
+		JOIN pg_class child  ON child.oid  = pg_inherits.inhrelid \
+		WHERE parent.relname = 'telemetry_events' \
+		ORDER BY child.relname;"
+	@echo "rows in the default partition should be 0; anything else means a day went uncreated"
 
 .PHONY: psql
 psql: ## Open a psql shell against the local database

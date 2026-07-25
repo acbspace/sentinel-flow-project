@@ -19,7 +19,7 @@ SentinelFlow turns a stream of telemetry into handled incidents, end to end:
 5. **Observe** — a React dashboard, an OpenTelemetry Collector, and Kubernetes
    manifests.
 
-It is built as eight Go microservices plus a React dashboard, and is portfolio
+It is built as nine Go microservices plus a React dashboard, and is portfolio
 quality throughout: everything compiles, nothing is stubbed, no error is
 swallowed, and every design decision is recorded in an ADR. What is deliberately
 *out of scope* is [named, not implied](#whats-deliberately-not-here).
@@ -34,6 +34,7 @@ swallowed, and every design decision is recorded in an ADR. What is deliberately
 │   ├── incidents-api       #   read / lifecycle / approval API
 │   ├── alerting            #   Temporal worker + alert starter
 │   ├── remediation         #   Temporal worker + runbook starter
+│   ├── janitor             #   partition maintenance and retention
 │   ├── order-service       #   demo producer
 │   ├── payment-service     #   demo producer
 │   └── migrate             #   schema migration runner
@@ -46,6 +47,7 @@ swallowed, and every design decision is recorded in an ADR. What is deliberately
 │   ├── incidentapi         # read / lifecycle / approval HTTP handler
 │   ├── kafkax  · store     # franz-go client; pgx pool + queries
 │   ├── obs · httpx · config # telemetry; server plumbing; env parsing
+│   ├── janitor · bench     # partition maintenance; benchmark harness
 │   └── demo · migrate      # traffic simulator; migration runner
 ├── web                     # React + TypeScript dashboard
 ├── deploy/k8s              # Kubernetes manifests: workloads, probes, HPAs
@@ -170,6 +172,7 @@ all there. To watch the workflows run, start the Temporal Web UI with
 | incidents-api | 8084 | read / lifecycle / approval API |
 | alerting | 8085 | Temporal worker + alert starter |
 | remediation | 8086 | runbook worker + remediation starter |
+| janitor | 8087 | partition maintenance and retention |
 | dashboard | 3000 | React UI (nginx, proxies `/v1`) |
 | PostgreSQL · Kafka · Temporal | 5432 · 29092 · 7233 | storage · log · workflows |
 | OTel Collector | 4318 | optional `otel` profile (Prometheus on 8889) |
@@ -214,8 +217,15 @@ bad value (unknown status/severity, non-UUID id, non-RFC3339 time) is a `400`:
 **Delivery is at-least-once, made safe by idempotent storage.** Guaranteed:
 
 - A `202` means the event is durably in Kafka (`acks=all`, synchronous).
-- The same `event_id` yields exactly one row — the database is the single
-  deduplication authority, under any number of engine replicas.
+- The same `(event_id, event_timestamp)` yields exactly one row — the database is
+  the single deduplication authority, under any number of engine replicas. The
+  pair, rather than `event_id` alone, because `telemetry_events` is
+  range-partitioned by day and PostgreSQL requires the partition key in every
+  unique constraint. Redeliveries are still collapsed: a replayed Kafka record is
+  byte-identical, so it carries the same timestamp and conflicts. What is no
+  longer rejected is one `event_id` submitted under two *different* timestamps,
+  which was never a redelivery. See
+  [migration 0006](migrations/0006_partition_telemetry_events.up.sql).
 - At most one **active incident** per fingerprint (partial unique index), and at
   most one **alert / remediation workflow** per incident (Temporal workflow id =
   incident id). Each escalation level and each runbook step happens exactly once,
@@ -302,7 +312,8 @@ close it already in place:
 - **One global correlation rule; no alert suppression; fixed-shift on-call.**
 - **No dead-letter topic.** A permanently failing *valid* message stalls its
   partition until an operator intervenes — the most significant ingestion gap.
-- **Single-node Kafka (RF=1)**, no retention policy, JSON on the wire.
+- **Single-node Kafka (RF=1)** and JSON on the wire. PostgreSQL retention is
+  handled (daily partitions, dropped by the janitor); Kafka retention is not.
 - **No frontend tests**, and no multi-region deployment — the latter is
   [analysis](docs/architecture.md), not a demo that would imply more than it does.
 

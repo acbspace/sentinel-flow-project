@@ -98,7 +98,7 @@ jobs:
       - name: Build every service
         run: |
           mkdir -p bin
-          for service in ingestion-api incident-engine incidents-api alerting remediation order-service payment-service migrate; do
+          for service in ingestion-api incident-engine incidents-api alerting remediation janitor order-service payment-service migrate; do
             echo "building $service"
             CGO_ENABLED=0 go build -trimpath -o "bin/$service" "./cmd/$service"
           done
@@ -198,7 +198,7 @@ jobs:
 
       - name: Build every service image
         run: |
-          for service in ingestion-api incident-engine incidents-api alerting remediation order-service payment-service migrate; do
+          for service in ingestion-api incident-engine incidents-api alerting remediation janitor order-service payment-service migrate; do
             echo "::group::building $service image"
             docker build --build-arg "SERVICE=$service" -f build/Dockerfile -t "sentinelflow/$service:ci" .
             echo "::endgroup::"

@@ -150,6 +150,30 @@ type DemoService struct {
 	ShutdownGrace time.Duration
 }
 
+// Janitor configures the partition maintenance service.
+type Janitor struct {
+	Observability Observability
+	HTTPAddr      string
+	PostgresDSN   string
+	DBTimeout     time.Duration
+
+	// Interval is how often a maintenance cycle runs.
+	Interval time.Duration
+
+	// Lookahead is how far ahead partitions are created. It must exceed any
+	// plausible outage of this service: a day with no partition does not fail,
+	// but its events land in the default partition and have to be drained back
+	// out later.
+	Lookahead time.Duration
+
+	// Retention is how long telemetry is kept. This is the one setting in the
+	// system that destroys data, so it has no clever default and is validated
+	// rather than silently coerced.
+	Retention time.Duration
+
+	ShutdownGrace time.Duration
+}
+
 // Migrate configures the schema migration tool.
 type Migrate struct {
 	PostgresDSN string
@@ -346,6 +370,40 @@ func LoadDemoService(serviceName, defaultAddr string, defaultFailureRate float64
 }
 
 // LoadMigrate reads the migration tool configuration.
+// LoadJanitor reads the partition janitor configuration.
+func LoadJanitor() (Janitor, error) {
+	var errs []error
+	cfg := Janitor{
+		Observability: loadObservability("janitor", &errs),
+		HTTPAddr:      stringVar("HTTP_ADDR", ":8087"),
+		PostgresDSN:   stringVar("POSTGRES_DSN", ""),
+		DBTimeout:     durationVar("DB_TIMEOUT", 30*time.Second, &errs),
+		Interval:      durationVar("JANITOR_INTERVAL", time.Hour, &errs),
+		Lookahead:     durationVar("PARTITION_LOOKAHEAD", 7*24*time.Hour, &errs),
+		Retention:     durationVar("TELEMETRY_RETENTION", 30*24*time.Hour, &errs),
+		ShutdownGrace: durationVar("SHUTDOWN_GRACE", 15*time.Second, &errs),
+	}
+	if cfg.PostgresDSN == "" {
+		errs = append(errs, errors.New("POSTGRES_DSN is required"))
+	}
+	if cfg.Interval <= 0 {
+		errs = append(errs, errors.New("JANITOR_INTERVAL must be greater than zero"))
+	}
+	if cfg.Lookahead < 24*time.Hour {
+		errs = append(errs, errors.New("PARTITION_LOOKAHEAD must be at least 24h; a shorter horizon sends events to the default partition"))
+	}
+	// The floor is not arbitrary: MAX_EVENT_BACKDATE defaults to 7 days, so a
+	// retention shorter than that would drop a partition the ingestion API is
+	// still willing to accept events for.
+	if cfg.Retention < 7*24*time.Hour {
+		errs = append(errs, errors.New("TELEMETRY_RETENTION must be at least 168h, matching the backdate the ingestion API accepts"))
+	}
+	if cfg.Lookahead >= cfg.Retention {
+		errs = append(errs, errors.New("PARTITION_LOOKAHEAD must be shorter than TELEMETRY_RETENTION"))
+	}
+	return cfg, errors.Join(errs...)
+}
+
 func LoadMigrate() (Migrate, error) {
 	var errs []error
 	cfg := Migrate{

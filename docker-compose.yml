@@ -364,6 +364,45 @@ services:
       retries: 10
       start_period: 15s
 
+  # Partition maintenance for telemetry_events: create the days about to be
+  # written to, drop the days past retention, report anything that landed in the
+  # default partition.
+  #
+  # Its own service because it is the only thing here that destroys data. Stop it
+  # and ingestion carries on — the lookahead is the margin that makes that safe.
+  janitor:
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+      args:
+        SERVICE: janitor
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      HTTP_ADDR: ":8087"
+      POSTGRES_DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      JANITOR_INTERVAL: ${JANITOR_INTERVAL:-1h}
+      PARTITION_LOOKAHEAD: ${PARTITION_LOOKAHEAD:-168h}
+      TELEMETRY_RETENTION: ${TELEMETRY_RETENTION:-720h}
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-none}
+      OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-none}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_METRIC_EXPORT_INTERVAL: ${OTEL_METRIC_EXPORT_INTERVAL:-60s}
+    ports:
+      - "${JANITOR_PORT:-8087}:8087"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8087/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
   # The incident dashboard. nginx serves the built React bundle and proxies /v1
   # through to incidents-api, so the browser stays same-origin and the API needs
   # no CORS handling.

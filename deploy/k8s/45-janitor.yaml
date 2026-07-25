@@ -1,0 +1,80 @@
+# Partition maintenance for telemetry_events.
+#
+# This is the only workload in SentinelFlow that destroys data, which is why it
+# is a separate Deployment rather than another loop inside the engine: it can be
+# scaled to zero to suspend retention without suspending ingestion, and it can be
+# rolled independently of anything on the request path.
+#
+# It has no HPA and must never have one. Two janitors would race to create the
+# same partition and to drop the same expired one — the work is idempotent enough
+# to survive that, but there is nothing to gain: one cycle an hour over a
+# catalogue of a few dozen partitions is not a throughput problem.
+apiVersion: v1
+kind: Service
+metadata:
+  name: janitor
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/name: janitor
+    app.kubernetes.io/part-of: sentinelflow
+spec:
+  selector:
+    app.kubernetes.io/name: janitor
+  ports:
+    - name: http
+      port: 8087
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: janitor
+  namespace: sentinelflow
+  labels:
+    app.kubernetes.io/name: janitor
+    app.kubernetes.io/part-of: sentinelflow
+spec:
+  replicas: 1
+  # Never run two at once, not even briefly during a rollout: a second janitor
+  # would contend on the ACCESS EXCLUSIVE lock the default-partition drain takes.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: janitor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: janitor
+        app.kubernetes.io/part-of: sentinelflow
+    spec:
+      # A cycle that is mid-drain has rows staged out of the default partition
+      # inside an open transaction. Killing it rolls that back safely, but give
+      # it room to finish rather than relying on the rollback.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: janitor
+          image: sentinelflow/janitor:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8087
+          env:
+            - name: HTTP_ADDR
+              value: ":8087"
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef: {name: sentinelflow-secrets, key: POSTGRES_DSN}
+          envFrom:
+            - configMapRef: {name: sentinelflow-config}
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}

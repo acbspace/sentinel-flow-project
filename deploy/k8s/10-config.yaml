@@ -33,6 +33,13 @@ data:
   CORRELATION_ERROR_RATE_MIN_EVENTS: "5"
   CORRELATION_RESOLVE_AFTER: "5m"
 
+  # Partition maintenance (janitor). TELEMETRY_RETENTION is the only setting in
+  # the system that destroys data, and it must be at least MAX_EVENT_BACKDATE or
+  # the janitor would drop a day the ingestion API still accepts events for.
+  JANITOR_INTERVAL: "1h"
+  PARTITION_LOOKAHEAD: "168h"
+  TELEMETRY_RETENTION: "720h"
+
   # Alerting and remediation pollers
   ALERT_POLL_INTERVAL: "10s"
   REMEDIATION_POLL_INTERVAL: "10s"
