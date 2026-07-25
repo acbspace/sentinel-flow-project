@@ -31,7 +31,7 @@ import (
 // IncidentStore is the incident access the handler needs. *store.IncidentStore
 // satisfies it; the interface exists so handler tests run without a database.
 type IncidentStore interface {
-	List(ctx context.Context, filter store.IncidentFilter) ([]incident.Incident, error)
+	List(ctx context.Context, filter store.IncidentFilter) ([]incident.Incident, store.Cursor, error)
 	Get(ctx context.Context, id string) (incident.Incident, error)
 	Acknowledge(ctx context.Context, id string) (incident.Incident, error)
 	Resolve(ctx context.Context, id string) (incident.Incident, error)
@@ -40,7 +40,7 @@ type IncidentStore interface {
 // EventStore is the stored-event access the handler needs. *store.EventStore
 // satisfies it.
 type EventStore interface {
-	ListEvents(ctx context.Context, filter store.EventFilter) ([]store.StoredEvent, error)
+	ListEvents(ctx context.Context, filter store.EventFilter) ([]store.StoredEvent, store.Cursor, error)
 }
 
 // NotificationStore reads an incident's alert timeline. *store.NotificationStore
@@ -139,14 +139,18 @@ type errorResponse struct {
 	Message string `json:"message"`
 }
 
+// NextCursor is the token to pass back as ?cursor= for the following page. It is
+// omitted when this page is the last, so its absence is the end-of-list signal.
 type incidentListResponse struct {
-	Incidents []incident.Incident `json:"incidents"`
-	Count     int                 `json:"count"`
+	Incidents  []incident.Incident `json:"incidents"`
+	Count      int                 `json:"count"`
+	NextCursor string              `json:"next_cursor,omitempty"`
 }
 
 type eventListResponse struct {
-	Events []store.StoredEvent `json:"events"`
-	Count  int                 `json:"count"`
+	Events     []store.StoredEvent `json:"events"`
+	Count      int                 `json:"count"`
+	NextCursor string              `json:"next_cursor,omitempty"`
 }
 
 type notificationListResponse struct {
@@ -177,7 +181,7 @@ func (h *Handler) ListIncidents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	incidents, err := h.incidents.List(ctx, filter)
+	incidents, next, err := h.incidents.List(ctx, filter)
 	if err != nil {
 		h.log.ErrorContext(ctx, "list incidents failed", slog.String("error", err.Error()))
 		h.writeError(ctx, w, http.StatusInternalServerError, "internal_error", "could not list incidents")
@@ -187,7 +191,11 @@ func (h *Handler) ListIncidents(w http.ResponseWriter, r *http.Request) {
 		incidents = []incident.Incident{}
 	}
 
-	httpx.WriteJSON(ctx, w, http.StatusOK, incidentListResponse{Incidents: incidents, Count: len(incidents)}, h.log)
+	httpx.WriteJSON(ctx, w, http.StatusOK, incidentListResponse{
+		Incidents:  incidents,
+		Count:      len(incidents),
+		NextCursor: next.Encode(),
+	}, h.log)
 }
 
 // GetIncident serves GET /v1/incidents/{id}.
@@ -407,7 +415,7 @@ func (h *Handler) ListEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	events, err := h.events.ListEvents(ctx, filter)
+	events, next, err := h.events.ListEvents(ctx, filter)
 	if err != nil {
 		h.log.ErrorContext(ctx, "list events failed", slog.String("error", err.Error()))
 		h.writeError(ctx, w, http.StatusInternalServerError, "internal_error", "could not list events")
@@ -417,7 +425,11 @@ func (h *Handler) ListEvents(w http.ResponseWriter, r *http.Request) {
 		events = []store.StoredEvent{}
 	}
 
-	httpx.WriteJSON(ctx, w, http.StatusOK, eventListResponse{Events: events, Count: len(events)}, h.log)
+	httpx.WriteJSON(ctx, w, http.StatusOK, eventListResponse{
+		Events:     events,
+		Count:      len(events),
+		NextCursor: next.Encode(),
+	}, h.log)
 }
 
 // incidentID extracts and validates the {id} path parameter, writing a 400 and
@@ -476,12 +488,13 @@ func parseIncidentFilter(r *http.Request) (store.IncidentFilter, error) {
 		return filter, err
 	}
 
-	limit, offset, err := parsePagination(q)
+	limit, offset, after, err := parsePagination(q)
 	if err != nil {
 		return filter, err
 	}
 	filter.Limit = limit
 	filter.Offset = offset
+	filter.After = after
 	return filter, nil
 }
 
@@ -514,12 +527,13 @@ func parseEventFilter(r *http.Request) (store.EventFilter, error) {
 	}
 	filter.Until = until
 
-	limit, offset, err := parsePagination(q)
+	limit, offset, after, err := parsePagination(q)
 	if err != nil {
 		return filter, err
 	}
 	filter.Limit = limit
 	filter.Offset = offset
+	filter.After = after
 	return filter, nil
 }
 
@@ -542,16 +556,29 @@ func parseTime(raw string) (time.Time, error) {
 	return time.Parse(time.RFC3339, raw)
 }
 
-func parsePagination(q url.Values) (limit, offset int, err error) {
+func parsePagination(q url.Values) (limit, offset int, after store.Cursor, err error) {
 	limit, err = parseNonNegative(q.Get("limit"), "limit")
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, store.Cursor{}, err
 	}
 	offset, err = parseNonNegative(q.Get("offset"), "offset")
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, store.Cursor{}, err
 	}
-	return limit, offset, nil
+
+	after, err = store.DecodeCursor(q.Get("cursor"))
+	if err != nil {
+		return 0, 0, store.Cursor{}, err
+	}
+
+	// Mixing the two is a client bug worth naming rather than silently resolving:
+	// a cursor already encodes a position, so an offset on top of it skips rows
+	// the caller has never seen.
+	if !after.IsZero() && offset > 0 {
+		return 0, 0, store.Cursor{}, fmt.Errorf("cursor and offset cannot be combined; use one or the other")
+	}
+
+	return limit, offset, after, nil
 }
 
 func parseNonNegative(raw, name string) (int, error) {

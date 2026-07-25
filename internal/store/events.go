@@ -197,6 +197,9 @@ type StoredEvent struct {
 
 // EventFilter selects and paginates stored events. A zero-valued field is not
 // filtered on; Since and Until bound event_timestamp inclusively when set.
+//
+// After and Offset are alternative ways to page. After is the one to use; Offset
+// remains for callers written against the older API.
 type EventFilter struct {
 	TenantID    string
 	ServiceName string
@@ -207,6 +210,7 @@ type EventFilter struct {
 	Until       time.Time
 	Limit       int
 	Offset      int
+	After       Cursor
 }
 
 // storedEventColumns is the read column order for a stored event, matched by
@@ -215,9 +219,10 @@ const storedEventColumns = `event_id, schema_version, tenant_id, service_name,
 	environment, event_type, severity, event_timestamp, trace_id, attributes,
 	received_at, processed_at`
 
-// ListEvents returns the stored events matching filter, newest first.
-func (s *EventStore) ListEvents(ctx context.Context, filter EventFilter) ([]StoredEvent, error) {
-	query, args := buildEventListQuery(filter)
+// ListEvents returns the stored events matching filter, newest first, and the
+// cursor for the next page. The cursor is empty when this page is the last.
+func (s *EventStore) ListEvents(ctx context.Context, filter EventFilter) ([]StoredEvent, Cursor, error) {
+	query, args, limit := buildEventListQuery(filter)
 
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
@@ -226,7 +231,7 @@ func (s *EventStore) ListEvents(ctx context.Context, filter EventFilter) ([]Stor
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		s.metrics.Record(ctx, "list_events", "error", time.Since(start))
-		return nil, fmt.Errorf("list events: %w", err)
+		return nil, Cursor{}, fmt.Errorf("list events: %w", err)
 	}
 	defer rows.Close()
 
@@ -235,23 +240,32 @@ func (s *EventStore) ListEvents(ctx context.Context, filter EventFilter) ([]Stor
 		ev, err := scanStoredEvent(rows)
 		if err != nil {
 			s.metrics.Record(ctx, "list_events", "error", time.Since(start))
-			return nil, fmt.Errorf("scan event: %w", err)
+			return nil, Cursor{}, fmt.Errorf("scan event: %w", err)
 		}
 		events = append(events, ev)
 	}
 	if err := rows.Err(); err != nil {
 		s.metrics.Record(ctx, "list_events", "error", time.Since(start))
-		return nil, fmt.Errorf("list events: %w", err)
+		return nil, Cursor{}, fmt.Errorf("list events: %w", err)
+	}
+
+	var next Cursor
+	if len(events) > limit {
+		// The extra row proves there is more; it belongs to the next page.
+		events = events[:limit]
+		last := events[len(events)-1]
+		next = Cursor{Time: last.Timestamp.Time, ID: last.EventID}
 	}
 
 	s.metrics.Record(ctx, "list_events", "ok", time.Since(start))
-	return events, nil
+	return events, next, nil
 }
 
-// buildEventListQuery renders the SELECT for ListEvents. Pure, for the same
+// buildEventListQuery renders the SELECT for ListEvents, returning the query,
+// its arguments and the page size the caller asked for. Pure, for the same
 // reason as buildIncidentListQuery: the placeholder arithmetic is exactly what a
 // unit test should pin.
-func buildEventListQuery(f EventFilter) (string, []any) {
+func buildEventListQuery(f EventFilter) (string, []any, int) {
 	var b filterBuilder
 	if f.TenantID != "" {
 		b.add("tenant_id = $%d", f.TenantID)
@@ -274,10 +288,15 @@ func buildEventListQuery(f EventFilter) (string, []any) {
 	if !f.Until.IsZero() {
 		b.add("event_timestamp <= $%d", f.Until)
 	}
+	b.after("event_timestamp", "event_id", f.After)
+
+	// event_id breaks ties so the order is total. Without it two events sharing a
+	// timestamp could straddle a page boundary and one would be skipped.
+	page, limit := b.paginate(f.Limit, f.Offset)
 
 	query := "SELECT " + storedEventColumns + " FROM telemetry_events" + b.where() +
-		" ORDER BY event_timestamp DESC" + b.paginate(f.Limit, f.Offset)
-	return query, b.args
+		" ORDER BY event_timestamp DESC, event_id DESC" + page
+	return query, b.args, limit
 }
 
 // scanStoredEvent reads one row in storedEventColumns order.

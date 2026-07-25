@@ -44,19 +44,38 @@ func (b *filterBuilder) where() string {
 	return " WHERE " + strings.Join(b.clauses, " AND ")
 }
 
-// paginate binds the (clamped) limit and offset as the final two arguments and
-// returns the trailing clause. It is called after every condition so the
-// placeholder numbers line up.
-func (b *filterBuilder) paginate(limit, offset int) string {
-	limit = normalizeLimit(limit)
-	if offset < 0 {
-		offset = 0
+// after adds the keyset condition for a cursor over (timeCol, idCol), both
+// ordered descending. The row-value comparison is what lets a single index seek
+// serve it; comparing the two columns separately would not.
+func (b *filterBuilder) after(timeCol, idCol string, c Cursor) {
+	if c.IsZero() {
+		return
 	}
-	b.args = append(b.args, limit)
-	limitClause := fmt.Sprintf(" LIMIT $%d", len(b.args))
-	b.args = append(b.args, offset)
-	offsetClause := fmt.Sprintf(" OFFSET $%d", len(b.args))
-	return limitClause + offsetClause
+	b.args = append(b.args, c.Time)
+	timePos := len(b.args)
+	b.args = append(b.args, c.ID)
+	idPos := len(b.args)
+	b.clauses = append(b.clauses,
+		fmt.Sprintf("(%s, %s) < ($%d, $%d)", timeCol, idCol, timePos, idPos))
+}
+
+// paginate binds the trailing LIMIT and, when asked for, OFFSET. It returns the
+// clause and the page size the caller requested.
+//
+// One more row than that is fetched. The extra row is how the caller learns
+// another page exists without a second count query, and it is dropped before the
+// results are returned.
+func (b *filterBuilder) paginate(limit, offset int) (string, int) {
+	limit = normalizeLimit(limit)
+
+	b.args = append(b.args, limit+1)
+	clause := fmt.Sprintf(" LIMIT $%d", len(b.args))
+
+	if offset > 0 {
+		b.args = append(b.args, offset)
+		clause += fmt.Sprintf(" OFFSET $%d", len(b.args))
+	}
+	return clause, limit
 }
 
 func normalizeLimit(limit int) int {

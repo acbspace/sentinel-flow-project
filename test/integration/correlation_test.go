@@ -112,7 +112,7 @@ func (h *correlationHarness) insertEvents(ctx context.Context, t *testing.T, ser
 func (h *correlationHarness) tenantIncidents(ctx context.Context, t *testing.T) []incident.Incident {
 	t.Helper()
 
-	got, err := h.incidents.List(ctx, store.IncidentFilter{TenantID: h.tenant})
+	got, _, err := h.incidents.List(ctx, store.IncidentFilter{TenantID: h.tenant})
 	if err != nil {
 		t.Fatalf("list incidents: %v", err)
 	}

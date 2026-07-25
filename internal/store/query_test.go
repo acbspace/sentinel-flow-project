@@ -44,22 +44,29 @@ func TestBuildIncidentListQuery(t *testing.T) {
 	t.Run("no filter uses defaults and no WHERE", func(t *testing.T) {
 		t.Parallel()
 
-		query, args := buildIncidentListQuery(IncidentFilter{})
+		query, args, limit := buildIncidentListQuery(IncidentFilter{})
 
 		if strings.Contains(query, "WHERE") {
 			t.Errorf("unfiltered query should have no WHERE clause:\n%s", query)
 		}
-		if !strings.Contains(query, "ORDER BY last_seen_at DESC LIMIT $1 OFFSET $2") {
+		// No OFFSET at all when none was asked for, and one row more than the
+		// page so the caller can tell whether another page exists.
+		if !strings.Contains(query, "ORDER BY last_seen_at DESC, id DESC LIMIT $1") {
 			t.Errorf("query missing expected ordering/pagination tail:\n%s", query)
 		}
-		wantArgs := []any{defaultListLimit, 0}
-		assertArgs(t, args, wantArgs)
+		if strings.Contains(query, "OFFSET") {
+			t.Errorf("query should carry no OFFSET when none was requested:\n%s", query)
+		}
+		if limit != defaultListLimit {
+			t.Errorf("limit = %d, want %d", limit, defaultListLimit)
+		}
+		assertArgs(t, args, []any{defaultListLimit + 1})
 	})
 
 	t.Run("filters bind in order with pagination last", func(t *testing.T) {
 		t.Parallel()
 
-		query, args := buildIncidentListQuery(IncidentFilter{
+		query, args, limit := buildIncidentListQuery(IncidentFilter{
 			Status:      "open",
 			TenantID:    "tenant-a",
 			ServiceName: "payment-service",
@@ -75,14 +82,39 @@ func TestBuildIncidentListQuery(t *testing.T) {
 		if !strings.Contains(query, "LIMIT $5 OFFSET $6") {
 			t.Errorf("pagination placeholders should follow the filters:\n%s", query)
 		}
-		assertArgs(t, args, []any{"open", "tenant-a", "payment-service", "error", 10, 20})
+		if limit != 10 {
+			t.Errorf("limit = %d, want 10", limit)
+		}
+		assertArgs(t, args, []any{"open", "tenant-a", "payment-service", "error", 11, 20})
+	})
+
+	t.Run("cursor becomes a row-value comparison", func(t *testing.T) {
+		t.Parallel()
+
+		seen := time.Date(2026, 7, 25, 9, 0, 0, 0, time.UTC)
+		query, args, _ := buildIncidentListQuery(IncidentFilter{
+			Status: "open",
+			Limit:  10,
+			After:  Cursor{Time: seen, ID: "abc"},
+		})
+
+		// A row-value comparison, not two separate conditions: only the former
+		// can be served by one index seek.
+		want := "WHERE status = $1 AND (last_seen_at, id) < ($2, $3)"
+		if !strings.Contains(query, want) {
+			t.Errorf("query missing expected keyset clause %q:\n%s", want, query)
+		}
+		assertArgs(t, args, []any{"open", seen, "abc", 11})
 	})
 
 	t.Run("oversized limit is clamped in the args", func(t *testing.T) {
 		t.Parallel()
 
-		_, args := buildIncidentListQuery(IncidentFilter{Limit: 10_000})
-		assertArgs(t, args, []any{maxListLimit, 0})
+		_, args, limit := buildIncidentListQuery(IncidentFilter{Limit: 10_000})
+		if limit != maxListLimit {
+			t.Errorf("limit = %d, want %d", limit, maxListLimit)
+		}
+		assertArgs(t, args, []any{maxListLimit + 1})
 	})
 }
 
@@ -92,7 +124,7 @@ func TestBuildEventListQuery(t *testing.T) {
 	since := time.Date(2026, 7, 24, 10, 0, 0, 0, time.UTC)
 	until := time.Date(2026, 7, 24, 11, 0, 0, 0, time.UTC)
 
-	query, args := buildEventListQuery(EventFilter{
+	query, args, limit := buildEventListQuery(EventFilter{
 		ServiceName: "payment-service",
 		Severity:    "error",
 		TraceID:     "abc123",
@@ -105,10 +137,26 @@ func TestBuildEventListQuery(t *testing.T) {
 	if !strings.Contains(query, want) {
 		t.Errorf("query missing expected WHERE clause %q:\n%s", want, query)
 	}
-	if !strings.Contains(query, "ORDER BY event_timestamp DESC LIMIT $6 OFFSET $7") {
+	if !strings.Contains(query, "ORDER BY event_timestamp DESC, event_id DESC LIMIT $6") {
 		t.Errorf("query missing expected ordering/pagination tail:\n%s", query)
 	}
-	assertArgs(t, args, []any{"payment-service", "error", "abc123", since, until, 5, 0})
+	if limit != 5 {
+		t.Errorf("limit = %d, want 5", limit)
+	}
+	assertArgs(t, args, []any{"payment-service", "error", "abc123", since, until, 6})
+}
+
+func TestBuildEventListQueryOrdersByTheKeysetColumns(t *testing.T) {
+	t.Parallel()
+
+	// The ordering has to match the cursor's columns exactly, or a page boundary
+	// can skip or repeat a row. Both are (timestamp, id) descending, and the
+	// partitioned table's primary key is exactly that pair.
+	query, _, _ := buildEventListQuery(EventFilter{})
+
+	if !strings.Contains(query, "ORDER BY event_timestamp DESC, event_id DESC") {
+		t.Errorf("event ordering must be total over the cursor columns:\n%s", query)
+	}
 }
 
 // assertArgs compares a builder's argument slice against the expected values,

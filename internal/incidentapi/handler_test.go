@@ -24,6 +24,7 @@ const sampleID = "11111111-1111-1111-1111-111111111111"
 
 type fakeIncidents struct {
 	list       []incident.Incident
+	nextCursor store.Cursor
 	listErr    error
 	listFilter store.IncidentFilter // captured from the last List call
 
@@ -36,9 +37,9 @@ type fakeIncidents struct {
 	resolveErr    error
 }
 
-func (f *fakeIncidents) List(_ context.Context, filter store.IncidentFilter) ([]incident.Incident, error) {
+func (f *fakeIncidents) List(_ context.Context, filter store.IncidentFilter) ([]incident.Incident, store.Cursor, error) {
 	f.listFilter = filter
-	return f.list, f.listErr
+	return f.list, f.nextCursor, f.listErr
 }
 
 func (f *fakeIncidents) Get(_ context.Context, _ string) (incident.Incident, error) {
@@ -54,14 +55,15 @@ func (f *fakeIncidents) Resolve(_ context.Context, _ string) (incident.Incident,
 }
 
 type fakeEvents struct {
-	events []store.StoredEvent
-	err    error
-	filter store.EventFilter // captured
+	events     []store.StoredEvent
+	nextCursor store.Cursor
+	err        error
+	filter     store.EventFilter // captured
 }
 
-func (f *fakeEvents) ListEvents(_ context.Context, filter store.EventFilter) ([]store.StoredEvent, error) {
+func (f *fakeEvents) ListEvents(_ context.Context, filter store.EventFilter) ([]store.StoredEvent, store.Cursor, error) {
 	f.filter = filter
-	return f.events, f.err
+	return f.events, f.nextCursor, f.err
 }
 
 func discardLogger() *slog.Logger {
@@ -563,4 +565,85 @@ func TestListEvents(t *testing.T) {
 			t.Errorf("status = %d, want 400", rec.Code)
 		}
 	})
+}
+
+func TestListIncidentsReturnsTheNextCursor(t *testing.T) {
+	t.Parallel()
+
+	seen := time.Date(2026, 7, 25, 9, 0, 0, 0, time.UTC)
+	next := store.Cursor{Time: seen, ID: "abc"}
+	inc := &fakeIncidents{list: []incident.Incident{sampleIncident()}, nextCursor: next}
+
+	rec := do(newServer(inc, &fakeEvents{}), http.MethodGet, "/v1/incidents")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+
+	var resp struct {
+		NextCursor string `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.NextCursor != next.Encode() {
+		t.Errorf("next_cursor = %q, want %q", resp.NextCursor, next.Encode())
+	}
+}
+
+func TestListIncidentsOmitsTheCursorOnTheLastPage(t *testing.T) {
+	t.Parallel()
+
+	inc := &fakeIncidents{list: []incident.Incident{sampleIncident()}}
+
+	rec := do(newServer(inc, &fakeEvents{}), http.MethodGet, "/v1/incidents")
+
+	// The absence of the field is the end-of-list signal, so it must not appear
+	// as an empty string that a client could mistake for a valid position.
+	if strings.Contains(rec.Body.String(), "next_cursor") {
+		t.Errorf("last page should carry no next_cursor:\n%s", rec.Body.String())
+	}
+}
+
+func TestListIncidentsPassesTheCursorToTheStore(t *testing.T) {
+	t.Parallel()
+
+	seen := time.Date(2026, 7, 25, 9, 0, 0, 0, time.UTC)
+	token := store.Cursor{Time: seen, ID: "abc"}.Encode()
+	inc := &fakeIncidents{}
+
+	rec := do(newServer(inc, &fakeEvents{}), http.MethodGet, "/v1/incidents?cursor="+token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	if !inc.listFilter.After.Time.Equal(seen) || inc.listFilter.After.ID != "abc" {
+		t.Errorf("filter.After = %+v, want %s/abc", inc.listFilter.After, seen)
+	}
+}
+
+func TestListRejectsAMalformedCursor(t *testing.T) {
+	t.Parallel()
+
+	srv := newServer(&fakeIncidents{}, &fakeEvents{})
+
+	for _, target := range []string{"/v1/incidents?cursor=!!!", "/v1/events?cursor=!!!"} {
+		rec := do(srv, http.MethodGet, target)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", target, rec.Code)
+		}
+	}
+}
+
+func TestListRejectsCursorCombinedWithOffset(t *testing.T) {
+	t.Parallel()
+
+	token := store.Cursor{Time: time.Now().UTC(), ID: "abc"}.Encode()
+
+	// A cursor already encodes a position; an offset on top of it silently skips
+	// rows the caller has never seen, so it is a 400 rather than a guess.
+	rec := do(newServer(&fakeIncidents{}, &fakeEvents{}), http.MethodGet,
+		"/v1/incidents?cursor="+token+"&offset=10")
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400; body: %s", rec.Code, rec.Body.String())
+	}
 }

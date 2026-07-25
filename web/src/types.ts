@@ -65,6 +65,8 @@ export interface RemediationAction {
 export interface IncidentListResponse {
   incidents: Incident[];
   count: number;
+  /** Pass back as ?cursor= for the next page. Absent on the last page. */
+  next_cursor?: string;
 }
 
 export interface NotificationListResponse {

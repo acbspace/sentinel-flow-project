@@ -110,6 +110,9 @@ const markRemediatedSQL = `UPDATE incidents SET remediated_at = now() WHERE id =
 
 // IncidentFilter selects and paginates a slice of incidents. A zero-valued field
 // is not filtered on; validation of the values themselves belongs to the caller.
+//
+// After and Offset are alternative ways to page. After is the one to use; Offset
+// remains for callers written against the older API.
 type IncidentFilter struct {
 	Status      string
 	TenantID    string
@@ -117,6 +120,7 @@ type IncidentFilter struct {
 	Severity    string
 	Limit       int
 	Offset      int
+	After       Cursor
 }
 
 // IncidentStore persists and queries incidents.
@@ -186,9 +190,10 @@ func (s *IncidentStore) UpsertOpen(ctx context.Context, inc incident.Incident) (
 	return inserted, nil
 }
 
-// List returns the incidents matching filter, newest activity first.
-func (s *IncidentStore) List(ctx context.Context, filter IncidentFilter) ([]incident.Incident, error) {
-	query, args := buildIncidentListQuery(filter)
+// List returns the incidents matching filter, newest activity first, and the
+// cursor for the next page. The cursor is empty when this page is the last.
+func (s *IncidentStore) List(ctx context.Context, filter IncidentFilter) ([]incident.Incident, Cursor, error) {
+	query, args, limit := buildIncidentListQuery(filter)
 
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
@@ -197,7 +202,7 @@ func (s *IncidentStore) List(ctx context.Context, filter IncidentFilter) ([]inci
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		s.metrics.Record(ctx, "list_incidents", "error", time.Since(start))
-		return nil, fmt.Errorf("list incidents: %w", err)
+		return nil, Cursor{}, fmt.Errorf("list incidents: %w", err)
 	}
 	defer rows.Close()
 
@@ -206,17 +211,24 @@ func (s *IncidentStore) List(ctx context.Context, filter IncidentFilter) ([]inci
 		inc, err := scanIncident(rows)
 		if err != nil {
 			s.metrics.Record(ctx, "list_incidents", "error", time.Since(start))
-			return nil, fmt.Errorf("scan incident: %w", err)
+			return nil, Cursor{}, fmt.Errorf("scan incident: %w", err)
 		}
 		incidents = append(incidents, inc)
 	}
 	if err := rows.Err(); err != nil {
 		s.metrics.Record(ctx, "list_incidents", "error", time.Since(start))
-		return nil, fmt.Errorf("list incidents: %w", err)
+		return nil, Cursor{}, fmt.Errorf("list incidents: %w", err)
+	}
+
+	var next Cursor
+	if len(incidents) > limit {
+		incidents = incidents[:limit]
+		last := incidents[len(incidents)-1]
+		next = Cursor{Time: last.LastSeenAt, ID: last.ID}
 	}
 
 	s.metrics.Record(ctx, "list_incidents", "ok", time.Since(start))
-	return incidents, nil
+	return incidents, next, nil
 }
 
 // Get returns one incident by id, or ErrIncidentNotFound.
@@ -427,7 +439,7 @@ func (s *IncidentStore) currentStatus(ctx context.Context, id string) (incident.
 // buildIncidentListQuery renders the SELECT for List. It is a pure function so
 // the placeholder numbering and clause composition can be unit tested without a
 // database.
-func buildIncidentListQuery(f IncidentFilter) (string, []any) {
+func buildIncidentListQuery(f IncidentFilter) (string, []any, int) {
 	var b filterBuilder
 	if f.Status != "" {
 		b.add("status = $%d", f.Status)
@@ -441,10 +453,13 @@ func buildIncidentListQuery(f IncidentFilter) (string, []any) {
 	if f.Severity != "" {
 		b.add("severity = $%d", f.Severity)
 	}
+	b.after("last_seen_at", "id", f.After)
+
+	page, limit := b.paginate(f.Limit, f.Offset)
 
 	query := "SELECT " + incidentColumns + " FROM incidents" + b.where() +
-		" ORDER BY last_seen_at DESC" + b.paginate(f.Limit, f.Offset)
-	return query, b.args
+		" ORDER BY last_seen_at DESC, id DESC" + page
+	return query, b.args, limit
 }
 
 // scanIncident reads one incident row in incidentColumns order. It is written

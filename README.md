@@ -200,7 +200,12 @@ curl -X POST http://localhost:8080/v1/events -H 'Content-Type: application/json'
 large · `415` non-JSON · `503` Kafka unavailable (retry).
 
 **incidents-api** (port 8084) — read-mostly; every list is paginated and every
-bad value (unknown status/severity, non-UUID id, non-RFC3339 time) is a `400`:
+bad value (unknown status/severity, non-UUID id, non-RFC3339 time) is a `400`.
+
+Lists page by cursor: a response carries `next_cursor` until the last page, and
+you pass it back as `?cursor=`. `?offset=` still works but degrades on a large
+table, because PostgreSQL walks and discards every skipped row. Combining the two
+is a `400`, since a cursor already encodes a position.
 
 | Endpoint | Purpose |
 |---|---|
