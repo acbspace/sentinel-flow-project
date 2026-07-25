@@ -159,11 +159,25 @@ func (v ValidationErrors) Error() string {
 	return "invalid event: " + strings.Join(parts, "; ")
 }
 
-// Validate reports every contract violation in the event. It is called at both
-// trust boundaries: once when the ingestion API accepts an event over HTTP, and
-// again when the incident engine reads it back off Kafka, because the topic can
-// also be written to by producers the API never saw.
+// Validate reports every structural contract violation in the event. It is
+// called at both trust boundaries: once when the ingestion API accepts an event
+// over HTTP, and again when the incident engine reads it back off Kafka,
+// because the topic can also be written to by producers the API never saw.
+//
+// It deliberately takes no clock and applies no time bounds, so that it stays a
+// pure function of the event. Callers that must also police the timestamp
+// against the current time use ValidateWithin.
 func (e Event) Validate() error {
+	if errs := e.validate(); len(errs) > 0 {
+		return errs
+	}
+	return nil
+}
+
+// validate collects the structural problems without deciding how to report
+// them, so that Validate and ValidateWithin build one combined error set rather
+// than two competing ones.
+func (e Event) validate() ValidationErrors {
 	var errs ValidationErrors
 
 	if e.EventID == "" {
@@ -211,10 +225,7 @@ func (e Event) Validate() error {
 		errs = append(errs, FieldError{"trace_id", fmt.Sprintf("must be at most %d characters", MaxTraceIDLen)})
 	}
 
-	if len(errs) > 0 {
-		return errs
-	}
-	return nil
+	return errs
 }
 
 func appendStringErrors(errs ValidationErrors, field, value string, maxLen int) ValidationErrors {

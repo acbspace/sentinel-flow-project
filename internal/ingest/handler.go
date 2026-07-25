@@ -32,6 +32,7 @@ type Handler struct {
 	publisher    Publisher
 	log          *slog.Logger
 	maxBodyBytes int64
+	bounds       event.TimeBounds
 	now          func() time.Time
 }
 
@@ -40,7 +41,12 @@ type Options struct {
 	Publisher    Publisher
 	Logger       *slog.Logger
 	MaxBodyBytes int64
-	Now          func() time.Time
+
+	// Bounds rejects events whose timestamp is implausibly far from now. The
+	// zero value disables both checks.
+	Bounds event.TimeBounds
+
+	Now func() time.Time
 }
 
 // NewHandler builds the ingestion handler.
@@ -55,6 +61,7 @@ func NewHandler(opts Options) *Handler {
 		publisher:    opts.Publisher,
 		log:          opts.Logger,
 		maxBodyBytes: opts.MaxBodyBytes,
+		bounds:       opts.Bounds,
 		now:          opts.Now,
 	}
 }
@@ -124,7 +131,9 @@ func (h *Handler) PostEvent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := ev.Validate(); err != nil {
+	// Both time bounds apply here: this is the last point at which a producer
+	// with a wrong clock can be told about it.
+	if err := ev.ValidateWithin(h.bounds, h.now()); err != nil {
 		var validationErrs event.ValidationErrors
 		if errors.As(err, &validationErrs) {
 			h.log.WarnContext(ctx, "event rejected",

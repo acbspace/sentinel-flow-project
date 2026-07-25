@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/acbspace/sentinel-flow-project/internal/config"
+	"github.com/acbspace/sentinel-flow-project/internal/event"
 	"github.com/acbspace/sentinel-flow-project/internal/httpx"
 	"github.com/acbspace/sentinel-flow-project/internal/ingest"
 	"github.com/acbspace/sentinel-flow-project/internal/kafkax"
@@ -83,6 +84,10 @@ func run() error {
 		Publisher:    producer,
 		Logger:       log,
 		MaxBodyBytes: cfg.MaxBodyBytes,
+		Bounds: event.TimeBounds{
+			MaxFuture: cfg.MaxEventFutureSkew,
+			MaxAge:    cfg.MaxEventBackdate,
+		},
 	})
 
 	router := newRouter(handler, producer, httpMetrics, providers, log)

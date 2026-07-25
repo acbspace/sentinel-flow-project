@@ -121,6 +121,9 @@ func run() error {
 			MaxDelay:    cfg.RetryMaxDelay,
 		},
 		Logger: log,
+		// Future skew only. The engine must never reject a record for being old,
+		// or draining a backlog would discard it.
+		Bounds: event.TimeBounds{MaxFuture: cfg.MaxEventFutureSkew},
 	})
 
 	runner := engine.NewRunner(engine.RunnerOptions{

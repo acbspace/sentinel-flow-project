@@ -40,7 +40,16 @@ type IngestionAPI struct {
 	HTTPAddr       string
 	MaxBodyBytes   int64
 	ProduceTimeout time.Duration
-	ShutdownGrace  time.Duration
+
+	// MaxEventFutureSkew and MaxEventBackdate reject events whose timestamp is
+	// implausible. The ingestion API is the only place that can tell a producer
+	// its clock is wrong while the producer is still there to hear it, so it is
+	// the one boundary that enforces both. Either may be zero to disable that
+	// bound; see event.TimeBounds for why the engine enforces only the first.
+	MaxEventFutureSkew time.Duration
+	MaxEventBackdate   time.Duration
+
+	ShutdownGrace time.Duration
 }
 
 // IncidentEngine configures the Kafka consumer that persists events.
@@ -51,6 +60,12 @@ type IncidentEngine struct {
 	HTTPAddr       string
 	PostgresDSN    string
 	MaxPollRecords int
+
+	// MaxEventFutureSkew is the only time bound the engine applies. Re-checking
+	// how old a record is would turn any Kafka backlog into discarded telemetry;
+	// see event.TimeBounds for the argument.
+	MaxEventFutureSkew time.Duration
+
 	DBTimeout      time.Duration
 	RetryAttempts  int
 	RetryBaseDelay time.Duration
@@ -150,10 +165,24 @@ func LoadIngestionAPI() (IngestionAPI, error) {
 		HTTPAddr:       stringVar("HTTP_ADDR", ":8080"),
 		MaxBodyBytes:   int64Var("MAX_BODY_BYTES", 64*1024, &errs),
 		ProduceTimeout: durationVar("KAFKA_PRODUCE_TIMEOUT", 10*time.Second, &errs),
-		ShutdownGrace:  durationVar("SHUTDOWN_GRACE", 15*time.Second, &errs),
+
+		// Five minutes of forward skew tolerates an unsynchronised host without
+		// admitting an event that would sit in every correlation window forever.
+		// Seven days of backdate accepts a genuine replay or a producer catching
+		// up after an outage, while keeping rows inside the retention horizon.
+		MaxEventFutureSkew: durationVar("MAX_EVENT_FUTURE_SKEW", 5*time.Minute, &errs),
+		MaxEventBackdate:   durationVar("MAX_EVENT_BACKDATE", 7*24*time.Hour, &errs),
+
+		ShutdownGrace: durationVar("SHUTDOWN_GRACE", 15*time.Second, &errs),
 	}
 	if cfg.MaxBodyBytes <= 0 {
 		errs = append(errs, errors.New("MAX_BODY_BYTES must be greater than zero"))
+	}
+	if cfg.MaxEventFutureSkew < 0 {
+		errs = append(errs, errors.New("MAX_EVENT_FUTURE_SKEW must not be negative (use 0 to disable the check)"))
+	}
+	if cfg.MaxEventBackdate < 0 {
+		errs = append(errs, errors.New("MAX_EVENT_BACKDATE must not be negative (use 0 to disable the check)"))
 	}
 	return cfg, errors.Join(errs...)
 }
@@ -168,6 +197,11 @@ func LoadIncidentEngine() (IncidentEngine, error) {
 		HTTPAddr:       stringVar("HTTP_ADDR", ":8081"),
 		PostgresDSN:    stringVar("POSTGRES_DSN", ""),
 		MaxPollRecords: intVar("KAFKA_MAX_POLL_RECORDS", 250, &errs),
+
+		// Matches the ingestion API's default so a record accepted there is never
+		// then rejected here. Note the absence of a backdate bound.
+		MaxEventFutureSkew: durationVar("MAX_EVENT_FUTURE_SKEW", 5*time.Minute, &errs),
+
 		DBTimeout:      durationVar("DB_TIMEOUT", 5*time.Second, &errs),
 		RetryAttempts:  intVar("DB_RETRY_ATTEMPTS", 5, &errs),
 		RetryBaseDelay: durationVar("DB_RETRY_BASE_DELAY", 100*time.Millisecond, &errs),
@@ -186,6 +220,9 @@ func LoadIncidentEngine() (IncidentEngine, error) {
 	}
 	if cfg.MaxPollRecords < 1 {
 		errs = append(errs, errors.New("KAFKA_MAX_POLL_RECORDS must be at least 1"))
+	}
+	if cfg.MaxEventFutureSkew < 0 {
+		errs = append(errs, errors.New("MAX_EVENT_FUTURE_SKEW must not be negative (use 0 to disable the check)"))
 	}
 	return cfg, errors.Join(errs...)
 }

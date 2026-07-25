@@ -88,11 +88,14 @@ var ErrPermanent = errors.New("permanent processing failure")
 
 // Processor turns one Kafka message into at most one database row.
 type Processor struct {
-	store EventStore
-	retry RetryPolicy
-	log   *slog.Logger
+	store  EventStore
+	retry  RetryPolicy
+	bounds event.TimeBounds
+	log    *slog.Logger
 	// sleep is injectable so retry tests do not spend real wall-clock time.
 	sleep func(ctx context.Context, d time.Duration) error
+	// now is injectable so the time-bound check is testable without waiting.
+	now func() time.Time
 }
 
 // ProcessorOptions configures a Processor.
@@ -100,7 +103,15 @@ type ProcessorOptions struct {
 	Store  EventStore
 	Retry  RetryPolicy
 	Logger *slog.Logger
-	Sleep  func(ctx context.Context, d time.Duration) error
+
+	// Bounds must carry a future bound only. Setting MaxAge here would classify
+	// any backlog older than it as permanently invalid and discard it; see
+	// event.TimeBounds. NewProcessor drops MaxAge rather than trusting callers
+	// to remember.
+	Bounds event.TimeBounds
+
+	Sleep func(ctx context.Context, d time.Duration) error
+	Now   func() time.Time
 }
 
 // NewProcessor builds a Processor.
@@ -111,11 +122,20 @@ func NewProcessor(opts ProcessorOptions) *Processor {
 	if opts.Sleep == nil {
 		opts.Sleep = sleepContext
 	}
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
 	return &Processor{
 		store: opts.Store,
 		retry: opts.Retry,
-		log:   opts.Logger,
-		sleep: opts.Sleep,
+		// Only the future bound survives. A MaxAge here would mean that draining
+		// a backlog older than it deleted the backlog, so the unsafe half of the
+		// configuration is discarded at construction rather than documented and
+		// hoped for.
+		bounds: event.TimeBounds{MaxFuture: opts.Bounds.MaxFuture},
+		log:    opts.Logger,
+		sleep:  opts.Sleep,
+		now:    opts.Now,
 	}
 }
 
@@ -135,8 +155,13 @@ func (p *Processor) Process(ctx context.Context, msg Message) (Outcome, error) {
 	// Revalidate on the way out of Kafka. The ingestion API is the usual
 	// producer, but the topic is not private to it, and a schema regression
 	// must not be able to write malformed rows.
+	//
+	// The future bound is re-applied here for the same reason, and is safe to
+	// re-apply because now only moves forward: anything that passed it at
+	// ingestion still passes it. How old the record is, by contrast, is never
+	// grounds for discarding it — that is just how backlogs look.
 	ev.Normalize()
-	if err := ev.Validate(); err != nil {
+	if err := ev.ValidateWithin(p.bounds, p.now()); err != nil {
 		p.logInvalid(ctx, msg, "message violates the telemetry event contract", err)
 		return OutcomeInvalid, nil
 	}

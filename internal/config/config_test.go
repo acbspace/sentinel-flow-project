@@ -402,3 +402,73 @@ func TestLoadDemoServiceUsesSuppliedDefaults(t *testing.T) {
 		t.Errorf("ServiceName = %q, want %q", cfg.Observability.ServiceName, "order-service")
 	}
 }
+
+func TestLoadIngestionAPIEventBoundDefaults(t *testing.T) {
+	t.Setenv("KAFKA_BROKERS", "kafka:9092")
+
+	cfg, err := config.LoadIngestionAPI()
+	if err != nil {
+		t.Fatalf("LoadIngestionAPI() = %v", err)
+	}
+
+	if cfg.MaxEventFutureSkew != 5*time.Minute {
+		t.Errorf("MaxEventFutureSkew = %v, want %v", cfg.MaxEventFutureSkew, 5*time.Minute)
+	}
+	if cfg.MaxEventBackdate != 7*24*time.Hour {
+		t.Errorf("MaxEventBackdate = %v, want %v", cfg.MaxEventBackdate, 7*24*time.Hour)
+	}
+}
+
+func TestLoadIngestionAPIRejectsNegativeEventBounds(t *testing.T) {
+	tests := map[string]string{
+		"MAX_EVENT_FUTURE_SKEW": "-1m",
+		"MAX_EVENT_BACKDATE":    "-1h",
+	}
+
+	for name, value := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("KAFKA_BROKERS", "kafka:9092")
+			t.Setenv(name, value)
+
+			_, err := config.LoadIngestionAPI()
+			if err == nil {
+				t.Fatalf("LoadIngestionAPI() = nil, want an error for %s=%s", name, value)
+			}
+			if !strings.Contains(err.Error(), name) {
+				t.Errorf("error %q should name %s", err, name)
+			}
+		})
+	}
+}
+
+func TestLoadIngestionAPIAllowsDisablingEventBounds(t *testing.T) {
+	// Zero is a documented opt-out rather than an error, so an operator can turn
+	// a bound off deliberately during a migration.
+	t.Setenv("KAFKA_BROKERS", "kafka:9092")
+	t.Setenv("MAX_EVENT_FUTURE_SKEW", "0")
+	t.Setenv("MAX_EVENT_BACKDATE", "0")
+
+	cfg, err := config.LoadIngestionAPI()
+	if err != nil {
+		t.Fatalf("LoadIngestionAPI() = %v", err)
+	}
+	if cfg.MaxEventFutureSkew != 0 || cfg.MaxEventBackdate != 0 {
+		t.Errorf("bounds = %v/%v, want 0/0", cfg.MaxEventFutureSkew, cfg.MaxEventBackdate)
+	}
+}
+
+func TestLoadIncidentEngineEventBoundDefault(t *testing.T) {
+	t.Setenv("KAFKA_BROKERS", "kafka:9092")
+	t.Setenv("POSTGRES_DSN", "postgres://localhost/db")
+
+	cfg, err := config.LoadIncidentEngine()
+	if err != nil {
+		t.Fatalf("LoadIncidentEngine() = %v", err)
+	}
+
+	// Must match the ingestion API's default, or a record accepted at the front
+	// door could be discarded by the engine that receives it.
+	if cfg.MaxEventFutureSkew != 5*time.Minute {
+		t.Errorf("MaxEventFutureSkew = %v, want %v", cfg.MaxEventFutureSkew, 5*time.Minute)
+	}
+}

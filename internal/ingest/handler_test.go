@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/acbspace/sentinel-flow-project/internal/event"
 	"github.com/acbspace/sentinel-flow-project/internal/ingest"
@@ -435,5 +436,105 @@ func TestPostEventAcceptsJSONContentTypeVariants(t *testing.T) {
 				t.Errorf("status = %d, want %d; body: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 			}
 		})
+	}
+}
+
+// boundsNow is the fixed "now" the time-bound tests measure against, so every
+// bound in them is exact rather than relative to the wall clock.
+var boundsNow = time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+
+func boundedHandler(publisher ingest.Publisher, bounds event.TimeBounds) *ingest.Handler {
+	return ingest.NewHandler(ingest.Options{
+		Publisher: publisher,
+		Logger:    discardLogger(),
+		Bounds:    bounds,
+		Now:       func() time.Time { return boundsNow },
+	})
+}
+
+// TestPostEventRejectsFutureDatedEvent pins the bug this bound exists for.
+//
+// The correlation window is "event_timestamp >= now() - window", so a row dated
+// in the future matches every window forever: it holds an incident open that can
+// never go quiet, and auto-resolution never fires. One such event is enough.
+func TestPostEventRejectsFutureDatedEvent(t *testing.T) {
+	t.Parallel()
+
+	publisher := &fakePublisher{}
+	handler := boundedHandler(publisher, event.TimeBounds{MaxFuture: 5 * time.Minute})
+
+	body := validBody()
+	body["timestamp"] = boundsNow.AddDate(4, 0, 0).Format(time.RFC3339)
+
+	rec := httptest.NewRecorder()
+	handler.PostEvent(rec, newRequest(jsonString(body)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+
+	var resp struct {
+		Error   string `json:"error"`
+		Details []struct {
+			Field string `json:"field"`
+		} `json:"details"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if resp.Error != "validation_failed" {
+		t.Errorf("error = %q, want %q", resp.Error, "validation_failed")
+	}
+	if len(resp.Details) == 0 || resp.Details[0].Field != "timestamp" {
+		t.Errorf("details = %+v, want a timestamp field error", resp.Details)
+	}
+
+	// The point of rejecting at the front door is that it never reaches Kafka,
+	// and therefore never reaches a correlation window.
+	if n := len(publisher.events()); n != 0 {
+		t.Errorf("published %d events, want 0", n)
+	}
+}
+
+func TestPostEventRejectsExcessivelyBackdatedEvent(t *testing.T) {
+	t.Parallel()
+
+	publisher := &fakePublisher{}
+	handler := boundedHandler(publisher, event.TimeBounds{MaxAge: 7 * 24 * time.Hour})
+
+	body := validBody()
+	body["timestamp"] = boundsNow.AddDate(-2, 0, 0).Format(time.RFC3339)
+
+	rec := httptest.NewRecorder()
+	handler.PostEvent(rec, newRequest(jsonString(body)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if n := len(publisher.events()); n != 0 {
+		t.Errorf("published %d events, want 0", n)
+	}
+}
+
+func TestPostEventAcceptsAnEventInsideBothBounds(t *testing.T) {
+	t.Parallel()
+
+	publisher := &fakePublisher{}
+	handler := boundedHandler(publisher, event.TimeBounds{
+		MaxFuture: 5 * time.Minute,
+		MaxAge:    7 * 24 * time.Hour,
+	})
+
+	body := validBody()
+	body["timestamp"] = boundsNow.Add(-time.Minute).Format(time.RFC3339)
+
+	rec := httptest.NewRecorder()
+	handler.PostEvent(rec, newRequest(jsonString(body)))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	if n := len(publisher.events()); n != 1 {
+		t.Errorf("published %d events, want 1", n)
 	}
 }

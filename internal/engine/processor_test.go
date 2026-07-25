@@ -470,3 +470,76 @@ func TestRetryPolicyDelay(t *testing.T) {
 		}
 	}
 }
+
+// engineNow is the fixed clock the time-bound tests measure against.
+var engineNow = time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+
+func boundedProcessor(store engine.EventStore, bounds event.TimeBounds) *engine.Processor {
+	return engine.NewProcessor(engine.ProcessorOptions{
+		Store:  store,
+		Retry:  engine.RetryPolicy{MaxAttempts: 1},
+		Logger: discardLogger(),
+		Bounds: bounds,
+		Now:    func() time.Time { return engineNow },
+	})
+}
+
+// TestProcessDiscardsFutureDatedEvent covers the half of the bound the engine
+// does enforce: the topic is not private to the ingestion API, so a rogue
+// producer writing straight to Kafka must not be able to plant a row that sits
+// in every correlation window forever.
+func TestProcessDiscardsFutureDatedEvent(t *testing.T) {
+	t.Parallel()
+
+	store := newFakeStore()
+	processor := boundedProcessor(store, event.TimeBounds{MaxFuture: 5 * time.Minute})
+
+	ev := validEvent()
+	ev.Timestamp = event.NewTimestamp(engineNow.AddDate(4, 0, 0))
+
+	outcome, err := processor.Process(context.Background(), messageFor(t, ev))
+	if err != nil {
+		t.Fatalf("Process() error = %v, want nil", err)
+	}
+	if outcome != engine.OutcomeInvalid {
+		t.Errorf("outcome = %q, want %q", outcome, engine.OutcomeInvalid)
+	}
+	if n := len(store.insertedEvents()); n != 0 {
+		t.Errorf("stored %d events, want 0", n)
+	}
+}
+
+// TestProcessStoresAnOldEventFromABacklog is the important half.
+//
+// An event's timestamp is fixed when it is produced, and waiting in Kafka only
+// makes it older. If the engine applied a maximum age, then draining a backlog
+// built up during an outage — precisely when telemetry matters most — would
+// classify every record in it as permanently invalid, log it, and commit its
+// offset. That is silent data loss wearing a validation costume, so the engine
+// must store this event however old it is.
+func TestProcessStoresAnOldEventFromABacklog(t *testing.T) {
+	t.Parallel()
+
+	store := newFakeStore()
+
+	// Configured as the ingestion API would be — both bounds — to prove the
+	// engine drops the age bound rather than trusting its caller not to set it.
+	processor := boundedProcessor(store, event.TimeBounds{
+		MaxFuture: 5 * time.Minute,
+		MaxAge:    7 * 24 * time.Hour,
+	})
+
+	ev := validEvent()
+	ev.Timestamp = event.NewTimestamp(engineNow.AddDate(-1, 0, 0))
+
+	outcome, err := processor.Process(context.Background(), messageFor(t, ev))
+	if err != nil {
+		t.Fatalf("Process() error = %v, want nil", err)
+	}
+	if outcome != engine.OutcomeStored {
+		t.Fatalf("outcome = %q, want %q — an old record is a backlog, not a defect", outcome, engine.OutcomeStored)
+	}
+	if n := len(store.insertedEvents()); n != 1 {
+		t.Errorf("stored %d events, want 1", n)
+	}
+}

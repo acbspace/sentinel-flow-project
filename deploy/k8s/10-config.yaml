@@ -18,6 +18,13 @@ data:
   TEMPORAL_ADDRESS: "temporal:7233"
   TEMPORAL_NAMESPACE: "default"
 
+  # Event timestamp bounds. MAX_EVENT_FUTURE_SKEW is read by both the ingestion
+  # API and the incident engine; MAX_EVENT_BACKDATE is read only by the ingestion
+  # API, because an event only gets older while it waits in Kafka and rejecting
+  # old records would turn a consumer backlog into lost telemetry.
+  MAX_EVENT_FUTURE_SKEW: "5m"
+  MAX_EVENT_BACKDATE: "168h"
+
   # Correlation (incident-engine)
   CORRELATION_ENABLED: "true"
   CORRELATION_INTERVAL: "15s"
