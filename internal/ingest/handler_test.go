@@ -24,6 +24,7 @@ import (
 type fakePublisher struct {
 	mu        sync.Mutex
 	published []event.Event
+	batches   int
 	err       error
 }
 
@@ -36,6 +37,26 @@ func (f *fakePublisher) Publish(_ context.Context, ev event.Event) error {
 	}
 	f.published = append(f.published, ev)
 	return nil
+}
+
+func (f *fakePublisher) PublishBatch(_ context.Context, evs []event.Event) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.err != nil {
+		return f.err
+	}
+	f.published = append(f.published, evs...)
+	f.batches++
+	return nil
+}
+
+// batchCount reports how many produce calls the batch took, which is the whole
+// point of the endpoint.
+func (f *fakePublisher) batchCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.batches
 }
 
 func (f *fakePublisher) events() []event.Event {

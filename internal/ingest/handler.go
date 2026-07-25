@@ -18,22 +18,28 @@ import (
 	"github.com/acbspace/sentinel-flow-project/internal/httpx"
 )
 
-// Publisher writes an accepted event to the durable log.
+// Publisher writes accepted events to the durable log.
 //
 // The handler depends on this interface rather than on the Kafka producer so
 // that its tests can assert on what would have been published without running a
 // broker.
+//
+// PublishBatch is all-or-nothing: it must not report success unless every event
+// is durable, because the handler turns that into a 202 for the whole set.
 type Publisher interface {
 	Publish(ctx context.Context, ev event.Event) error
+	PublishBatch(ctx context.Context, evs []event.Event) error
 }
 
-// Handler serves POST /v1/events.
+// Handler serves POST /v1/events and POST /v1/events:batch.
 type Handler struct {
-	publisher    Publisher
-	log          *slog.Logger
-	maxBodyBytes int64
-	bounds       event.TimeBounds
-	now          func() time.Time
+	publisher      Publisher
+	log            *slog.Logger
+	maxBodyBytes   int64
+	maxBatchBytes  int64
+	maxBatchEvents int
+	bounds         event.TimeBounds
+	now            func() time.Time
 }
 
 // Options configures the handler. now is injectable so tests are deterministic.
@@ -41,6 +47,13 @@ type Options struct {
 	Publisher    Publisher
 	Logger       *slog.Logger
 	MaxBodyBytes int64
+
+	// MaxBatchBytes and MaxBatchEvents bound the batch endpoint. They are
+	// separate from MaxBodyBytes because a batch is legitimately far larger than
+	// a single event, and capping both at the same value would make the batch
+	// endpoint useless.
+	MaxBatchBytes  int64
+	MaxBatchEvents int
 
 	// Bounds rejects events whose timestamp is implausibly far from now. The
 	// zero value disables both checks.
@@ -54,15 +67,23 @@ func NewHandler(opts Options) *Handler {
 	if opts.MaxBodyBytes <= 0 {
 		opts.MaxBodyBytes = 64 * 1024
 	}
+	if opts.MaxBatchBytes <= 0 {
+		opts.MaxBatchBytes = 5 * 1024 * 1024
+	}
+	if opts.MaxBatchEvents <= 0 {
+		opts.MaxBatchEvents = 1000
+	}
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
 	return &Handler{
-		publisher:    opts.Publisher,
-		log:          opts.Logger,
-		maxBodyBytes: opts.MaxBodyBytes,
-		bounds:       opts.Bounds,
-		now:          opts.Now,
+		publisher:      opts.Publisher,
+		log:            opts.Logger,
+		maxBodyBytes:   opts.MaxBodyBytes,
+		maxBatchBytes:  opts.MaxBatchBytes,
+		maxBatchEvents: opts.MaxBatchEvents,
+		bounds:         opts.Bounds,
+		now:            opts.Now,
 	}
 }
 

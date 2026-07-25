@@ -81,9 +81,11 @@ func run() error {
 	defer closeProducer(producer, log, cfg.ShutdownGrace)
 
 	handler := ingest.NewHandler(ingest.Options{
-		Publisher:    producer,
-		Logger:       log,
-		MaxBodyBytes: cfg.MaxBodyBytes,
+		Publisher:      producer,
+		Logger:         log,
+		MaxBodyBytes:   cfg.MaxBodyBytes,
+		MaxBatchBytes:  cfg.MaxBatchBytes,
+		MaxBatchEvents: cfg.MaxBatchEvents,
 		Bounds: event.TimeBounds{
 			MaxFuture: cfg.MaxEventFutureSkew,
 			MaxAge:    cfg.MaxEventBackdate,
@@ -135,6 +137,7 @@ func newRouter(
 		Check: producer.Ping,
 	}))
 	router.Post("/v1/events", handler.PostEvent)
+	router.Post("/v1/events:batch", handler.PostEventBatch)
 
 	// otelhttp wraps the whole router so that trace context arriving from a
 	// caller is extracted before any handler runs.

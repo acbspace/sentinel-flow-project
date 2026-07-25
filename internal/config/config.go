@@ -41,6 +41,11 @@ type IngestionAPI struct {
 	MaxBodyBytes   int64
 	ProduceTimeout time.Duration
 
+	// Bounds on the batch endpoint, kept separate from MaxBodyBytes: a batch is
+	// legitimately much larger than one event.
+	MaxBatchBytes  int64
+	MaxBatchEvents int
+
 	// MaxEventFutureSkew and MaxEventBackdate reject events whose timestamp is
 	// implausible. The ingestion API is the only place that can tell a producer
 	// its clock is wrong while the producer is still there to hear it, so it is
@@ -189,6 +194,8 @@ func LoadIngestionAPI() (IngestionAPI, error) {
 		HTTPAddr:       stringVar("HTTP_ADDR", ":8080"),
 		MaxBodyBytes:   int64Var("MAX_BODY_BYTES", 64*1024, &errs),
 		ProduceTimeout: durationVar("KAFKA_PRODUCE_TIMEOUT", 10*time.Second, &errs),
+		MaxBatchBytes:  int64Var("MAX_BATCH_BYTES", 5*1024*1024, &errs),
+		MaxBatchEvents: intVar("MAX_BATCH_EVENTS", 1000, &errs),
 
 		// Five minutes of forward skew tolerates an unsynchronised host without
 		// admitting an event that would sit in every correlation window forever.
@@ -201,6 +208,12 @@ func LoadIngestionAPI() (IngestionAPI, error) {
 	}
 	if cfg.MaxBodyBytes <= 0 {
 		errs = append(errs, errors.New("MAX_BODY_BYTES must be greater than zero"))
+	}
+	if cfg.MaxBatchBytes <= 0 {
+		errs = append(errs, errors.New("MAX_BATCH_BYTES must be greater than zero"))
+	}
+	if cfg.MaxBatchEvents <= 0 {
+		errs = append(errs, errors.New("MAX_BATCH_EVENTS must be greater than zero"))
 	}
 	if cfg.MaxEventFutureSkew < 0 {
 		errs = append(errs, errors.New("MAX_EVENT_FUTURE_SKEW must not be negative (use 0 to disable the check)"))

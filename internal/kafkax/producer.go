@@ -165,6 +165,72 @@ func (p *Producer) Publish(ctx context.Context, ev event.Event) error {
 	return nil
 }
 
+// PublishBatch writes every event in one produce call and blocks until the
+// broker has acknowledged all of them.
+//
+// The durability contract is unchanged and deliberately all-or-nothing: this
+// returns an error if any single record failed, so a 202 still means every event
+// in the request is durable. The caller retries the whole batch, and the
+// engine's idempotent insert collapses whatever was already written.
+func (p *Producer) PublishBatch(ctx context.Context, events []event.Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	ctx, span := p.tracer.Start(ctx, "publish batch "+p.topic,
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "kafka"),
+			attribute.String("messaging.destination.name", p.topic),
+			attribute.String("messaging.operation.name", "publish"),
+			attribute.Int("messaging.batch.message_count", len(events)),
+		),
+	)
+	defer span.End()
+
+	records := make([]*kgo.Record, 0, len(events))
+	for _, ev := range events {
+		payload, err := json.Marshal(ev)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "encode event")
+			return fmt.Errorf("encode event %s: %w", ev.EventID, err)
+		}
+
+		record := NewRecord(p.topic, ev, payload)
+		p.propagator.Inject(ctx, NewRecordCarrier(record))
+		records = append(records, record)
+	}
+
+	produceCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+
+	start := time.Now()
+	results := p.client.ProduceSync(produceCtx, records...)
+	elapsed := time.Since(start)
+
+	if err := results.FirstErr(); err != nil {
+		p.metrics.RecordPublish(ctx, p.topic, "error", elapsed)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "produce failed")
+		p.log.ErrorContext(ctx, "kafka batch produce failed",
+			slog.String("topic", p.topic),
+			slog.Int("events", len(events)),
+			slog.String("error", err.Error()),
+		)
+		return fmt.Errorf("produce %d events to %s: %w", len(events), p.topic, err)
+	}
+
+	p.metrics.RecordPublish(ctx, p.topic, "success", elapsed)
+
+	p.log.InfoContext(ctx, "event batch published",
+		slog.String("topic", p.topic),
+		slog.Int("events", len(events)),
+		slog.Int64("duration_ms", elapsed.Milliseconds()),
+	)
+	return nil
+}
+
 // NewRecord builds the Kafka record for an event.
 //
 // The key is the event's partition key, which is what makes every event from a

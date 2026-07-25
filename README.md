@@ -199,6 +199,26 @@ curl -X POST http://localhost:8080/v1/events -H 'Content-Type: application/json'
 `202` once durable · `400` lists **every** validation problem at once · `413` too
 large · `415` non-JSON · `503` Kafka unavailable (retry).
 
+**`POST /v1/events:batch`** — up to 1000 events in one request, one Kafka produce.
+
+```bash
+curl -X POST http://localhost:8080/v1/events:batch -H 'Content-Type: application/json' \
+  -d '{"events": [ {...}, {...} ]}'
+```
+
+Bad events are rejected individually rather than costing the caller the rest of
+the batch, so a `202` can still carry rejections and **the response body must be
+read**:
+
+```json
+{"status":"accepted","accepted":3,"rejected":1,
+ "errors":[{"index":2,"error":"validation_failed","details":[...]}]}
+```
+
+`index` is the event's position in the request. A `202` still means every event
+counted in `accepted` is durable — a failed produce is a `503` for the whole
+batch, not a partial success. `400` if nothing in the batch was valid.
+
 **incidents-api** (port 8084) — read-mostly; every list is paginated and every
 bad value (unknown status/severity, non-UUID id, non-RFC3339 time) is a `400`.
 

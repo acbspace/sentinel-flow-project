@@ -168,6 +168,55 @@ func EventsTarget(baseURL string, opts EventOptions) (Target, error) {
 	}, nil
 }
 
+// EventsBatchTarget measures the batch path: the same validation and the same
+// synchronous acks=all produce, but amortised over size events per request
+// instead of one.
+//
+// Throughput here is reported in requests per second like every other row, so
+// multiply by size to compare it against the single-event path in events.
+func EventsBatchTarget(baseURL string, opts EventOptions, size int) (Target, error) {
+	if size < 1 {
+		return Target{}, fmt.Errorf("batch size %d must be at least 1", size)
+	}
+
+	single, err := EventsTarget(baseURL, opts)
+	if err != nil {
+		return Target{}, err
+	}
+	endpoint, err := join(baseURL, "/v1/events:batch")
+	if err != nil {
+		return Target{}, err
+	}
+
+	body := func() ([]byte, error) {
+		items := make([]json.RawMessage, 0, size)
+		for range size {
+			one, err := single.Body()
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, one)
+		}
+
+		payload, err := json.Marshal(struct {
+			Events []json.RawMessage `json:"events"`
+		}{Events: items})
+		if err != nil {
+			return nil, fmt.Errorf("encode bench batch: %w", err)
+		}
+		return payload, nil
+	}
+
+	return Target{
+		Name:        "POST /v1/events:batch",
+		Work:        fmt.Sprintf("+ %d events per request, one Kafka `acks=all`", size),
+		Method:      "POST",
+		URL:         endpoint,
+		ContentType: "application/json",
+		Body:        body,
+	}, nil
+}
+
 // severitySupported checks a severity against the event contract's vocabulary,
 // so a typo in a flag fails before the run rather than producing a run in which
 // every request is a 400.

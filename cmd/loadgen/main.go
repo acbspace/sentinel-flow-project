@@ -38,7 +38,8 @@ func run(args []string, out *os.File) error {
 	var (
 		ingestionURL = fs.String("ingestion-url", "http://localhost:8080", "base URL of the ingestion API")
 		incidentsURL = fs.String("incidents-url", "http://localhost:8084", "base URL of the incidents API")
-		targets      = fs.String("targets", "all", "which paths to measure: all, health, incidents, events (comma separated)")
+		targets      = fs.String("targets", "all", "which paths to measure: all, health, incidents, events, batch (comma separated)")
+		batchSize    = fs.Int("batch-size", 100, "events per request for the batch target")
 		workers      = fs.Int("workers", 50, "concurrent in-flight requests")
 		duration     = fs.Duration("duration", 10*time.Second, "how long to measure each path")
 		requests     = fs.Int("requests", 0, "exact requests per path; overrides -duration when set")
@@ -53,7 +54,7 @@ func run(args []string, out *os.File) error {
 		return err
 	}
 
-	selected, err := selectTargets(*targets, *ingestionURL, *incidentsURL, bench.EventOptions{
+	selected, err := selectTargets(*targets, *ingestionURL, *incidentsURL, *batchSize, bench.EventOptions{
 		TenantID:     *tenant,
 		ServiceName:  *service,
 		ServiceCount: *serviceCount,
@@ -115,7 +116,7 @@ func run(args []string, out *os.File) error {
 
 // selectTargets turns the -targets flag into the targets to measure, in a stable
 // order so two runs produce comparable tables.
-func selectTargets(spec, ingestionURL, incidentsURL string, eventOpts bench.EventOptions) ([]bench.Target, error) {
+func selectTargets(spec, ingestionURL, incidentsURL string, batchSize int, eventOpts bench.EventOptions) ([]bench.Target, error) {
 	wanted := make(map[string]bool)
 	for _, name := range strings.Split(spec, ",") {
 		name = strings.ToLower(strings.TrimSpace(name))
@@ -129,7 +130,7 @@ func selectTargets(spec, ingestionURL, incidentsURL string, eventOpts bench.Even
 	}
 
 	all := wanted["all"]
-	known := map[string]bool{"all": true, "health": true, "incidents": true, "events": true}
+	known := map[string]bool{"all": true, "health": true, "incidents": true, "events": true, "batch": true}
 	for name := range wanted {
 		if !known[name] {
 			return nil, fmt.Errorf("unknown target %q (want all, health, incidents or events)", name)
@@ -154,6 +155,13 @@ func selectTargets(spec, ingestionURL, incidentsURL string, eventOpts bench.Even
 	}
 	if all || wanted["events"] {
 		target, err := bench.EventsTarget(ingestionURL, eventOpts)
+		if err != nil {
+			return nil, err
+		}
+		selected = append(selected, target)
+	}
+	if all || wanted["batch"] {
+		target, err := bench.EventsBatchTarget(ingestionURL, eventOpts, batchSize)
 		if err != nil {
 			return nil, err
 		}
