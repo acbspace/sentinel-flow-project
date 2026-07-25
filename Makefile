@@ -5,8 +5,15 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
-# Every executable lives in cmd/<name>; keep this list in sync with that layout.
+# Every executable lives in cmd/<name>. SERVICES are the deployable ones: they
+# get built into ./bin, get a container image, and have a manifest. Keep this
+# list in sync with that layout.
 SERVICES := ingestion-api incident-engine incidents-api alerting remediation order-service payment-service migrate
+
+# Development-only executables in cmd/. They are deliberately absent from
+# SERVICES: a load generator has no place in a deployed image, and adding one
+# there would ship a traffic cannon next to the thing it points at.
+TOOLS := loadgen
 
 BIN_DIR := bin
 COMPOSE := docker compose
@@ -203,6 +210,29 @@ reject: ## Reject the pending remediation step (usage: make reject INCIDENT=<id>
 .PHONY: verify
 verify: ## Show what the pipeline has stored, including incidents and actions
 	@bash scripts/verify.sh
+
+# ---- benchmark ---------------------------------------------------------------
+
+# 50 workers is the concurrency the README's table describes; the duration and
+# warmup are this harness's own, since the original run's were never recorded.
+# Override any of them: make bench BENCH_WORKERS=100 BENCH_DURATION=30s
+BENCH_TARGETS ?= all
+BENCH_WORKERS ?= 50
+BENCH_DURATION ?= 10s
+BENCH_WARMUP ?= 500
+
+.PHONY: bench
+bench: ## Measure the HTTP paths and print the README's benchmark table (requires `make up`)
+	@echo "benchmarking against $(INGESTION_URL) and $(INCIDENTS_URL)"
+	@echo "note: this writes real events; they are tagged tenant_id=bench-tenant at info severity"
+	@echo
+	@$(GO) run ./cmd/loadgen \
+		-ingestion-url=$(INGESTION_URL) \
+		-incidents-url=$(INCIDENTS_URL) \
+		-targets=$(BENCH_TARGETS) \
+		-workers=$(BENCH_WORKERS) \
+		-duration=$(BENCH_DURATION) \
+		-warmup=$(BENCH_WARMUP)
 
 .PHONY: psql
 psql: ## Open a psql shell against the local database
