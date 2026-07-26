@@ -59,13 +59,6 @@ smaller or safer, produce the before-and-after number.
 
 ## 5. This repository
 
-**Never write "Milestone N", "(m2)", or "this milestone"** anywhere — docs, ADRs,
-comments, Makefile output. The numbering has no referent outside this repo, it
-reads as scaffolding rather than documentation, and it rots: several such
-comments outlived the work they described. Name the thing instead — "ingestion",
-"correlation", "alerting", "remediation" — and cross-reference by section (`§12`)
-or artifact (`migration 0005`, `ADR 0003`).
-
 **Do not commit or push unless asked.** Leave changes in the working tree.
 
 **Layout.** `cmd/<service>` is wiring only: config → telemetry → dependencies →
