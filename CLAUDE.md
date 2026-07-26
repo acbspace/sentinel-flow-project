@@ -59,8 +59,6 @@ smaller or safer, produce the before-and-after number.
 
 ## 5. This repository
 
-**Do not commit or push unless asked.** Leave changes in the working tree.
-
 **Layout.** `cmd/<service>` is wiring only: config → telemetry → dependencies →
 run. Logic lives in `internal/`. Deployable services are listed in the Makefile's
 `SERVICES`; development-only binaries go in `TOOLS` and get no image or manifest.
