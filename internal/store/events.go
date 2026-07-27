@@ -131,36 +131,54 @@ func (s *EventStore) Ping(ctx context.Context) error {
 }
 
 // ServiceWindow is the per-service event tally over a time window: the total
-// number of events and how many of them were error or critical. It is the input
-// the correlation engine's error-rate rule reasons over.
+// number of events, how many of them were error or critical, and how many of
+// those errors are new. It is the input the correlation engine's error-rate rule
+// reasons over.
 type ServiceWindow struct {
 	TenantID    string
 	ServiceName string
 	Total       int64
 	Errors      int64
+
+	// NewErrors is the subset of Errors at or after the countSince bound.
+	//
+	// Correlation windows overlap: a 60s window evaluated every 15s observes the
+	// same event four times. Errors is therefore the right number to judge a rate
+	// on and the right evidence to open an incident with, but it must not be what
+	// a repeat detection adds to an already-open incident's running total —
+	// NewErrors is.
+	NewErrors int64
 }
 
 // windowStatsSQL aggregates recent events per tenant and service. The FILTER
-// clause counts the bad events in the same pass as the total, so one scan yields
-// both numbers the error-rate rule needs.
+// clauses count the bad events, and the newly arrived subset of them, in the
+// same pass as the total, so one scan yields every number the error-rate rule
+// and the incident counter need.
 const windowStatsSQL = `
 SELECT tenant_id,
        service_name,
        count(*)                                                        AS total,
-       count(*) FILTER (WHERE severity IN ('error', 'critical'))        AS errors
+       count(*) FILTER (WHERE severity IN ('error', 'critical'))        AS errors,
+       count(*) FILTER (WHERE severity IN ('error', 'critical')
+                          AND event_timestamp >= $2)                    AS new_errors
 FROM telemetry_events
 WHERE event_timestamp >= $1
 GROUP BY tenant_id, service_name`
 
 // WindowStats returns the per-service event tallies for every event at or after
-// since. Services with no events in the window are simply absent from the
-// result rather than reported as zero.
-func (s *EventStore) WindowStats(ctx context.Context, since time.Time) ([]ServiceWindow, error) {
+// since, counting separately those at or after countSince. Services with no
+// events in the window are simply absent from the result rather than reported as
+// zero.
+//
+// countSince is expected to be within [since, now]; the caller clamps it to the
+// window start so that a first cycle, or one that follows a long gap, still
+// counts every event the window covers exactly once.
+func (s *EventStore) WindowStats(ctx context.Context, since, countSince time.Time) ([]ServiceWindow, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	start := time.Now()
-	rows, err := s.pool.Query(ctx, windowStatsSQL, since)
+	rows, err := s.pool.Query(ctx, windowStatsSQL, since, countSince)
 	if err != nil {
 		s.metrics.Record(ctx, "window_stats", "error", time.Since(start))
 		return nil, fmt.Errorf("aggregate window stats: %w", err)
@@ -170,7 +188,7 @@ func (s *EventStore) WindowStats(ctx context.Context, since time.Time) ([]Servic
 	var windows []ServiceWindow
 	for rows.Next() {
 		var w ServiceWindow
-		if err := rows.Scan(&w.TenantID, &w.ServiceName, &w.Total, &w.Errors); err != nil {
+		if err := rows.Scan(&w.TenantID, &w.ServiceName, &w.Total, &w.Errors, &w.NewErrors); err != nil {
 			s.metrics.Record(ctx, "window_stats", "error", time.Since(start))
 			return nil, fmt.Errorf("scan window stats: %w", err)
 		}
