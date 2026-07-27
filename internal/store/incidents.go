@@ -46,6 +46,12 @@ const incidentColumns = `id, fingerprint, tenant_id, service_name, rule_id, titl
 // includes the rule id, so they cannot change within one active incident.
 // RETURNING (xmax = 0) reports whether this call inserted (true) or grouped
 // (false): xmax is zero only on a freshly inserted row.
+//
+// The two event counts are deliberately different values. Opening uses $8, the
+// whole window's tally, because that is the evidence the incident opened on.
+// Grouping adds $12, only the events new since the previous cycle: consecutive
+// windows overlap, so adding EXCLUDED.event_count here would count every event
+// once per cycle it remains inside the window.
 const upsertIncidentSQL = `
 INSERT INTO incidents (
     id, fingerprint, tenant_id, service_name, rule_id, title, severity, status,
@@ -54,7 +60,7 @@ INSERT INTO incidents (
 ON CONFLICT (fingerprint) WHERE status <> 'resolved'
 DO UPDATE SET
     last_seen_at = GREATEST(incidents.last_seen_at, EXCLUDED.last_seen_at),
-    event_count  = incidents.event_count + EXCLUDED.event_count,
+    event_count  = incidents.event_count + $12,
     updated_at   = now()
 RETURNING (xmax = 0) AS inserted`
 
@@ -141,7 +147,11 @@ func NewIncidentStore(pool *pgxpool.Pool, metrics *obs.DBMetrics, timeout time.D
 // UpsertOpen opens the incident or groups it into the active one sharing its
 // fingerprint, and reports which happened: true means a new incident was opened,
 // false means an existing one absorbed this detection.
-func (s *IncidentStore) UpsertOpen(ctx context.Context, inc incident.Incident) (bool, error) {
+//
+// inc.EventCount seeds a newly opened incident; groupedIncrement is what an
+// already-open one advances by. They differ because correlation windows overlap
+// — see upsertIncidentSQL.
+func (s *IncidentStore) UpsertOpen(ctx context.Context, inc incident.Incident, groupedIncrement int64) (bool, error) {
 	if err := inc.Validate(); err != nil {
 		s.metrics.Record(ctx, "upsert_incident", "error", 0)
 		return false, err
@@ -174,6 +184,7 @@ func (s *IncidentStore) UpsertOpen(ctx context.Context, inc incident.Incident) (
 		inc.FirstSeenAt,
 		inc.LastSeenAt,
 		details,
+		groupedIncrement,
 	).Scan(&inserted)
 	elapsed := time.Since(start)
 
