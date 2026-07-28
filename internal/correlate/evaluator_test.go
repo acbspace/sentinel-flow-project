@@ -20,22 +20,27 @@ type fakeSource struct {
 	windows []store.ServiceWindow
 	err     error
 
-	calls int
-	since time.Time
+	calls      int
+	since      time.Time
+	countSince time.Time
 }
 
-func (f *fakeSource) WindowStats(_ context.Context, since time.Time) ([]store.ServiceWindow, error) {
+func (f *fakeSource) WindowStats(_ context.Context, since, countSince time.Time) ([]store.ServiceWindow, error) {
 	f.calls++
 	f.since = since
+	f.countSince = countSince
 	return f.windows, f.err
 }
 
-// fakeSink stands in for the incident store. It simulates the store's dedup
-// contract in memory: the first upsert of a fingerprint "opens" (returns true),
-// a later upsert of the same fingerprint "groups" (returns false).
+// fakeSink stands in for the incident store. It simulates the store's dedup and
+// counting contract in memory: the first upsert of a fingerprint "opens"
+// (returns true) and seeds the total from the incident's own EventCount, while a
+// later upsert of the same fingerprint "groups" (returns false) and advances the
+// total by groupedIncrement — exactly what upsertIncidentSQL does.
 type fakeSink struct {
 	upserts   []incident.Incident
 	active    map[string]bool
+	totals    map[string]int64
 	opened    int
 	grouped   int
 	upsertErr error
@@ -46,19 +51,22 @@ type fakeSink struct {
 	resolveArg   time.Time
 }
 
-func (f *fakeSink) UpsertOpen(_ context.Context, inc incident.Incident) (bool, error) {
+func (f *fakeSink) UpsertOpen(_ context.Context, inc incident.Incident, groupedIncrement int64) (bool, error) {
 	if f.upsertErr != nil {
 		return false, f.upsertErr
 	}
 	f.upserts = append(f.upserts, inc)
 	if f.active == nil {
 		f.active = make(map[string]bool)
+		f.totals = make(map[string]int64)
 	}
 	if f.active[inc.Fingerprint] {
+		f.totals[inc.Fingerprint] += groupedIncrement
 		f.grouped++
 		return false, nil
 	}
 	f.active[inc.Fingerprint] = true
+	f.totals[inc.Fingerprint] = inc.EventCount
 	f.opened++
 	return true, nil
 }
@@ -188,6 +196,101 @@ func TestEvaluateOnceGroupsRepeatDetection(t *testing.T) {
 	}
 	if len(sink.active) != 1 {
 		t.Errorf("active fingerprints = %d, want 1", len(sink.active))
+	}
+}
+
+// Correlation windows overlap — a 60s window on a 15s cadence sees each event
+// four times — so an event must be counted into an incident exactly once, no
+// matter how many cycles observe it while it is still inside the window.
+func TestEvaluateOnceCountsOverlappingWindowsOnce(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	fingerprint := incident.Fingerprint("error_rate", "tenant-a", "payment-service")
+	ctx := context.Background()
+
+	// Cycle 1 opens on the 15 errors it can see.
+	src := &fakeSource{windows: []store.ServiceWindow{window(20, 15)}}
+	sink := &fakeSink{}
+	ev := newEvaluator(src, sink, now)
+
+	if err := ev.EvaluateOnce(ctx); err != nil {
+		t.Fatalf("first EvaluateOnce() = %v", err)
+	}
+	if got := sink.totals[fingerprint]; got != 15 {
+		t.Fatalf("event_count after opening = %d, want 15", got)
+	}
+
+	// Cycles 2 and 3 still see those same 15 errors in the window, plus 3 and
+	// then 2 genuinely new ones.
+	src.windows = []store.ServiceWindow{windowWithNew(23, 18, 3)}
+	if err := ev.EvaluateOnce(ctx); err != nil {
+		t.Fatalf("second EvaluateOnce() = %v", err)
+	}
+	src.windows = []store.ServiceWindow{windowWithNew(25, 20, 2)}
+	if err := ev.EvaluateOnce(ctx); err != nil {
+		t.Fatalf("third EvaluateOnce() = %v", err)
+	}
+
+	// 15 + 3 + 2. Summing each window's whole tally instead would give 15+18+20.
+	if got := sink.totals[fingerprint]; got != 20 {
+		t.Errorf("event_count = %d, want 20 (15 opened + 3 + 2 new)", got)
+	}
+}
+
+// The counting bound is the previous cycle, clamped to the window start so the
+// first cycle counts everything the window covers and nothing earlier.
+func TestEvaluateOnceCountsFromThePreviousCycle(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	src := &fakeSource{windows: []store.ServiceWindow{window(20, 15)}}
+	ev := newEvaluator(src, &fakeSink{}, now)
+	ctx := context.Background()
+
+	if err := ev.EvaluateOnce(ctx); err != nil {
+		t.Fatalf("first EvaluateOnce() = %v", err)
+	}
+	// No previous cycle, so the count bound is the window start, not the epoch.
+	if !src.countSince.Equal(src.since) {
+		t.Errorf("first cycle countSince = %v, want the window start %v", src.countSince, src.since)
+	}
+
+	if err := ev.EvaluateOnce(ctx); err != nil {
+		t.Fatalf("second EvaluateOnce() = %v", err)
+	}
+	// The clock is fixed, so the previous cycle ran at now and is inside the
+	// window: the second cycle counts only from there.
+	if !src.countSince.Equal(now) {
+		t.Errorf("second cycle countSince = %v, want the previous cycle at %v", src.countSince, now)
+	}
+}
+
+// A cycle that fails part-way must not advance the counting bound, or the events
+// in the slice it abandoned would never be counted into an incident.
+func TestEvaluateOnceKeepsCountBoundAfterFailure(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	src := &fakeSource{windows: []store.ServiceWindow{window(20, 15)}}
+	sink := &fakeSink{upsertErr: errors.New("database unreachable")}
+	ev := newEvaluator(src, sink, now)
+	ctx := context.Background()
+
+	if err := ev.EvaluateOnce(ctx); err == nil {
+		t.Fatal("EvaluateOnce() = nil, want the upsert error to propagate")
+	}
+
+	sink.upsertErr = nil
+	if err := ev.EvaluateOnce(ctx); err != nil {
+		t.Fatalf("second EvaluateOnce() = %v", err)
+	}
+	if !src.countSince.Equal(src.since) {
+		t.Errorf("countSince = %v after a failed cycle, want still the window start %v",
+			src.countSince, src.since)
+	}
+	if got := sink.totals[incident.Fingerprint("error_rate", "tenant-a", "payment-service")]; got != 15 {
+		t.Errorf("event_count = %d, want 15 — the failed cycle's slice must still be counted", got)
 	}
 }
 

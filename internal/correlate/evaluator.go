@@ -17,13 +17,13 @@ import (
 // an interface so the evaluator can be tested against a fake without a database;
 // *store.EventStore satisfies it.
 type WindowSource interface {
-	WindowStats(ctx context.Context, since time.Time) ([]store.ServiceWindow, error)
+	WindowStats(ctx context.Context, since, countSince time.Time) ([]store.ServiceWindow, error)
 }
 
 // IncidentSink persists the incidents the evaluator opens and closes the ones it
 // auto-resolves. *store.IncidentStore satisfies it.
 type IncidentSink interface {
-	UpsertOpen(ctx context.Context, inc incident.Incident) (bool, error)
+	UpsertOpen(ctx context.Context, inc incident.Incident, groupedIncrement int64) (bool, error)
 	AutoResolveStale(ctx context.Context, olderThan time.Time) (int64, error)
 }
 
@@ -36,6 +36,17 @@ type Evaluator struct {
 	metrics      *obs.CorrelationMetrics
 	log          *slog.Logger
 	resolveAfter time.Duration
+
+	// lastCycleAt is when the previous successful cycle ran. It bounds the slice
+	// of each window whose events have not been counted into an incident yet, so
+	// overlapping windows do not count the same event twice. It is zero until the
+	// first cycle completes, which makes that cycle count its whole window — the
+	// right amount for an incident it is about to open.
+	//
+	// Only Runner calls EvaluateOnce, from a single goroutine, so this needs no
+	// synchronisation. It is per-process state, which is sound because the
+	// advisory lock keeps one replica evaluating for as long as it holds the lock.
+	lastCycleAt time.Time
 
 	// now and newID are injected so tests are deterministic: a fixed clock makes
 	// the window bounds and resolve cutoff exact, and a scripted id generator
@@ -96,8 +107,17 @@ func (e *Evaluator) EvaluateOnce(ctx context.Context) error {
 
 	var opened, grouped int
 	for window, rules := range byWindow {
-		since := e.now().Add(-window)
-		windows, err := e.source.WindowStats(ctx, since)
+		since := start.Add(-window)
+
+		// Count only what the previous cycle did not, but never reach back past
+		// the window itself: a first cycle, or one following a gap longer than
+		// the window, has no earlier events left to count.
+		countSince := since
+		if e.lastCycleAt.After(countSince) {
+			countSince = e.lastCycleAt
+		}
+
+		windows, err := e.source.WindowStats(ctx, since, countSince)
 		if err != nil {
 			e.metrics.RecordEvaluation(ctx, "error", e.now().Sub(start))
 			return fmt.Errorf("read window stats for %s lookback: %w", window, err)
@@ -111,7 +131,7 @@ func (e *Evaluator) EvaluateOnce(ctx context.Context) error {
 				}
 
 				inc := e.buildIncident(r, w, det)
-				isNew, err := e.sink.UpsertOpen(ctx, inc)
+				isNew, err := e.sink.UpsertOpen(ctx, inc, det.NewEventCount)
 				if err != nil {
 					e.metrics.RecordEvaluation(ctx, "error", e.now().Sub(start))
 					return fmt.Errorf("open incident for rule %s on %s/%s: %w",
@@ -150,6 +170,10 @@ func (e *Evaluator) EvaluateOnce(ctx context.Context) error {
 			slog.Duration("quiet_period", e.resolveAfter),
 		)
 	}
+
+	// Advanced only here, so a cycle that failed part-way leaves the bound where
+	// it was and the next cycle re-counts that slice rather than skipping it.
+	e.lastCycleAt = start
 
 	e.metrics.RecordEvaluation(ctx, "ok", e.now().Sub(start))
 	e.metrics.RecordIncidents(ctx, opened, grouped, int(resolved))
