@@ -21,12 +21,21 @@ func errorRateRule() correlate.Rule {
 	}
 }
 
+// window is a freshly filled window: every error in it is new, which is what a
+// first cycle sees.
 func window(total, errs int64) store.ServiceWindow {
+	return windowWithNew(total, errs, errs)
+}
+
+// windowWithNew is an overlapping window: errs events are inside it but only
+// newErrs of them arrived since the previous cycle.
+func windowWithNew(total, errs, newErrs int64) store.ServiceWindow {
 	return store.ServiceWindow{
 		TenantID:    "tenant-a",
 		ServiceName: "payment-service",
 		Total:       total,
 		Errors:      errs,
+		NewErrors:   newErrs,
 	}
 }
 

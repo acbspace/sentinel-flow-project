@@ -5,8 +5,15 @@
 //
 // Correlation is deliberately windowed and database-backed rather than
 // per-event: an error *rate* is a property of a window, not of a single event,
-// and keeping all state in PostgreSQL means the engine can restart, or run more
-// than one replica, without losing or double-counting incidents.
+// and keeping all state in PostgreSQL means the engine can restart mid-cycle
+// without losing or double-counting incidents.
+//
+// Across replicas, incident identity is still a database guarantee — the partial
+// unique index admits one active incident per fingerprint however many engines
+// run. The cycle itself is not idempotent, though: consecutive windows overlap,
+// so two replicas evaluating the same tick would each add their slice to
+// event_count, and each would repeat the window scan. One evaluator is therefore
+// elected by a PostgreSQL advisory lock; see Runner and store.CycleLock.
 package correlate
 
 import (
@@ -64,9 +71,14 @@ type Detection struct {
 	// Title is a human-readable one-line summary for the incident.
 	Title string
 
-	// EventCount is how many offending events this detection observed; it is
-	// added to the incident's running total.
+	// EventCount is how many offending events this detection observed across the
+	// whole window. It seeds the incident's total when this detection opens one.
 	EventCount int64
+
+	// NewEventCount is how many of those events arrived since the previous cycle.
+	// Windows overlap, so this — not EventCount — is what a repeat detection adds
+	// to an incident that is already open.
+	NewEventCount int64
 
 	// Details is the evidence behind the detection, stored on the incident so an
 	// operator can see why it opened without re-running the query.
@@ -102,7 +114,8 @@ func (r Rule) evaluateErrorRate(w store.ServiceWindow) Detection {
 		Fires: true,
 		Title: fmt.Sprintf("%s: %.0f%% error rate on %s (%d of %d events over %s)",
 			r.Name, rate*100, w.ServiceName, w.Errors, w.Total, r.Window),
-		EventCount: w.Errors,
+		EventCount:    w.Errors,
+		NewEventCount: w.NewErrors,
 		Details: map[string]any{
 			"rule_id":      r.ID,
 			"kind":         string(r.Kind),
