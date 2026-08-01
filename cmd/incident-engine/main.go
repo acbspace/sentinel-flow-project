@@ -168,7 +168,11 @@ func run() error {
 			Now:          time.Now,
 			NewID:        uuid.NewString,
 		})
-		correlationRunner = correlate.NewRunner(evaluator, cfg.Correlation.Interval, log)
+		// One evaluator across every replica. Ingestion scales out freely, but a
+		// second concurrent correlation cycle would repeat each window scan and
+		// add its own slice to the same incident's event_count.
+		lease := store.NewCycleLock(pool, store.CorrelationLockKey, log)
+		correlationRunner = correlate.NewRunner(evaluator, cfg.Correlation.Interval, lease, log)
 	}
 
 	log.Info("incident-engine starting",
